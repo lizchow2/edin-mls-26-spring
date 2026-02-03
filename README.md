@@ -70,7 +70,7 @@ Follow this recommended progression:
 This course covers two GPU programming frameworks with identical lesson structures:
 
 | Framework | Directory | Best For |
-|-----------|-----------|---------|----------|
+|-----------|-----------|----------|
 | **cuTile** | `cutile-tutorial/` | NVIDIA-specific optimization |
 | **Triton** | `triton-tutorial/` | Cross-platform, Python-native |
 
@@ -145,6 +145,8 @@ flowchart TD
 ---
 
 ## Homework 1: Automatic Speech Recognition
+
+As we discussed in [Tool Comparison](https://github.com/ed-aisys/edin-mls-26-spring#tool-comparison), CUDA can be quite complex and daunting for beginners, while CuPy may experience significant performance issues. We aimed to strike a balance between ease of programming and performance. Therefore, we offer two frameworks for HW1: the CuTile version and the Triton version.
 
 The `hw1-asr/` directory contains a hands-on assignment implementing GPU-accelerated speech recognition:
 
