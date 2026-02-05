@@ -4,7 +4,6 @@ Performance: 3652ms (15.7x slower than PyTorch)
 
 Key Characteristics:
 - Pure CuPy tensor operations
-- No FlashAttention (materializes full attention matrix)
 - Uses CuPy einsum for attention computation
 """
 
@@ -18,9 +17,6 @@ if _dir not in sys.path:
     sys.path.insert(0, _dir)
 
 # Import with version-specific settings
-from . import attention
-attention.USE_FLASH_ATTENTION = False
-
 from . import layers
 layers.Linear.BACKEND = 'cublas'  # Use basic backend for baseline
 layers.MLP.FUSED = False

@@ -88,7 +88,7 @@ def load_cutile_model_generic(folder_name, backend_config=None):
 
     # Clear cached modules
     mods_to_clear = [m for m in sys.modules.keys()
-                     if m in ['weight_loader', 'model', 'layers', 'attention', 'rope', 'conv', 'flash_attention', 'decode_attention']]
+                     if m in ['weight_loader', 'model', 'layers', 'attention', 'rope', 'conv', 'decode_attention']]
     for m in mods_to_clear:
         del sys.modules[m]
 
@@ -101,10 +101,6 @@ def load_cutile_model_generic(folder_name, backend_config=None):
             layers.MLP.USE_CUBLAS_FP16 = backend_config['USE_CUBLAS_FP16']
         if 'FUSED' in backend_config:
             layers.MLP.FUSED = backend_config['FUSED']
-
-        if 'USE_FLASH_ATTENTION' in backend_config:
-            attention = importlib.import_module("attention")
-            attention.USE_FLASH_ATTENTION = backend_config['USE_FLASH_ATTENTION']
 
     weight_loader = importlib.import_module("weight_loader")
     model, processor = weight_loader.load_model_from_hf("zai-org/GLM-ASR-Nano-2512")
@@ -131,8 +127,7 @@ def load_cutile_example_model():
     """Load CuTile Example (Initial CuPy) model."""
     config = {
         'BACKEND': 'cublas',
-        'FUSED': False,
-        'USE_FLASH_ATTENTION': False
+        'FUSED': False
     }
     return load_cutile_model_generic("glm_asr_cutile_example", config)
 

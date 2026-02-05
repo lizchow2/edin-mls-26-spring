@@ -112,7 +112,6 @@ python rope.py       # Test RoPE kernels
 | `attention.py` | **TODO** | Attention kernels |
 | `layers.py` | **TODO** | Layer kernels (RMSNorm, GELU, Linear) |
 | `rope.py` | **TODO** | RoPE kernels |
-| `flash_attention.py` | Complete | FlashAttention reference |
 | `conv.py` | Complete | Convolution layers |
 | `model.py` | Complete | Full model using your kernels |
 | `weight_loader.py` | Complete | Weight loading utilities |

@@ -172,12 +172,12 @@ x_norm = x / sqrt(mean(x²) + eps) * weight
 This implementation prioritizes clarity over optimization:
 - Explicit loops instead of fused operations
 - Verbose comments explaining each step
-- No flash attention or other optimizations
+- No attention optimizations
 - Easy to trace through with a debugger
 
 For production use, consider:
 - Using the official transformers implementation
-- Flash attention for faster inference
+- Attention optimizations for faster inference
 - Quantization for reduced memory
 - KV cache optimizations
 

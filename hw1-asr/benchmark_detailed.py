@@ -357,36 +357,6 @@ def profile_attention_ops(model, seq_len=256, num_runs=5):
     results['cublas_attention'] = np.mean(cublas_times)
     print(f"  cuBLAS: {np.mean(cublas_times):.2f}ms (+/- {np.std(cublas_times):.2f}ms)")
 
-    # 3. FlashAttention (if available)
-    print("\n[3] FlashAttention (if available)...")
-    try:
-        # Try to import flash attention from the model's module
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        folder = "glm_asr_cutile_example"
-        sys.path.insert(0, os.path.join(script_dir, folder))
-
-        from flash_attention import flash_attention_forward
-
-        flash_times = []
-        q_flash = q.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, num_heads, head_dim)
-        k_flash = k.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, num_heads, head_dim)
-        v_flash = v.transpose(0, 2, 1, 3).reshape(batch_size, seq_len, num_heads, head_dim)
-
-        for _ in range(num_runs):
-            cp.cuda.Device().synchronize()
-            timer.start()
-            output = flash_attention_forward(q_flash, k_flash, v_flash)
-            elapsed = timer.stop()
-            flash_times.append(elapsed)
-
-        results['flash_attention'] = np.mean(flash_times)
-        print(f"  FlashAttention: {np.mean(flash_times):.2f}ms (+/- {np.std(flash_times):.2f}ms)")
-
-        sys.path.pop(0)
-    except Exception as e:
-        print(f"  FlashAttention: Not available ({e})")
-        results['flash_attention'] = None
-
     return results
 
 
@@ -526,7 +496,6 @@ def print_summary(component_results, attention_results, linear_results):
         for key, label in [
             ('standard_attention', 'Standard (einsum)'),
             ('cublas_attention', 'cuBLAS matmul'),
-            ('flash_attention', 'FlashAttention'),
         ]:
             if key in attention_results and attention_results[key] is not None:
                 print(f"  {label:<25} {attention_results[key]:>10.2f}ms")
@@ -637,7 +606,7 @@ def main():
 
     # Clear cached modules
     for mod_name in list(sys.modules.keys()):
-        if mod_name in ['weight_loader', 'model', 'layers', 'attention', 'flash_attention', 'rope', 'conv']:
+        if mod_name in ['weight_loader', 'model', 'layers', 'attention', 'rope', 'conv']:
             del sys.modules[mod_name]
 
     print(f"\nLoading model from {args.folder}...")

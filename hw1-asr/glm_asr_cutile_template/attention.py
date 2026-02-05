@@ -11,13 +11,6 @@ import cupy as cp
 import numpy as np
 from typing import Optional, Tuple
 
-# Import FlashAttention (provided)
-from flash_attention import flash_attention
-
-# Global flag to enable/disable FlashAttention
-# Baseline: FlashAttention disabled - uses CuPy fallback (einsum-based attention)
-USE_FLASH_ATTENTION = False
-
 
 def get_stream():
     """Get current CUDA stream pointer."""
@@ -218,12 +211,6 @@ class MultiHeadAttention:
         batch, num_heads, seq_q, head_dim = q.shape
         _, num_kv_heads, seq_k, _ = k.shape
 
-        # FlashAttention path (if enabled)
-        if USE_FLASH_ATTENTION and attention_mask is None:
-            return scaled_dot_product_attention(
-                q, k, v, attention_mask, is_causal, self.scale
-            )
-
         # Expand KV for GQA if needed
         if num_kv_heads != num_heads:
             k = self._expand_kv(k, self.num_queries_per_kv)
@@ -279,13 +266,6 @@ def scaled_dot_product_attention(
 
     if scale is None:
         scale = 1.0 / np.sqrt(head_dim)
-
-    # Try FlashAttention first
-    if USE_FLASH_ATTENTION and attention_mask is None:
-        try:
-            return flash_attention(q, k, v, scale, causal=is_causal)
-        except Exception:
-            pass
 
     # Check if dimensions fit CuTile requirements
     seq_k_padded = next_power_of_two(seq_k)

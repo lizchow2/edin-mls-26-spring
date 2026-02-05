@@ -26,7 +26,7 @@ student_version/
 
 | Version | Description | Performance |
 |---------|-------------|-------------|
-| `glm_asr_cutile_example` | Baseline: Pure CuPy, no FlashAttention | ~3200ms |
+| `glm_asr_cutile_example` | Baseline: Pure CuPy | ~3200ms |
 | `glm_asr_scratch` | PyTorch reference implementation | - |
 
 ## Quick Start
@@ -36,7 +36,7 @@ Environment setup (from repo root):
 source utils/setup-cutile.sh   # CuTile track
 ```
 
-Both setup scripts install common ML tooling used by the demo:
+`setup-cutile.sh` installs common ML tooling used by the demo:
 `transformers`, `huggingface_hub`, `streamlit`, `soundfile`, `scipy`.
 
 ### 1. Test Reference Implementations

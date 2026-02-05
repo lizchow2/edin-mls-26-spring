@@ -136,11 +136,11 @@ fi
 # =========================
 # Install Triton stack
 # =========================
-echo ">>> Installing Triton stack (torch, numpy, triton)"
-ask_continue "Install Python packages (torch, numpy, triton)?"
+echo ">>> Installing Triton stack (torch, numpy, triton, cupy, datasets)"
+ask_continue "Install Python packages (torch, numpy, triton, cupy, datasets)?"
 
 pip install --upgrade pip
-pip install torch numpy triton
+pip install torch numpy triton cupy datasets
 
 # =========================
 # Done
@@ -158,6 +158,8 @@ echo "Installed key packages:"
 echo "  - torch"
 echo "  - numpy"
 echo "  - triton"
+echo "  - cupy"
+echo "  - datasets"
 echo
 echo "NOTE: For CUDA-enabled torch builds, follow the PyTorch install guide"
 echo "and install the matching CUDA wheel for your driver/toolkit."

@@ -1,21 +1,12 @@
 """
 Pure CuTile Multi-Head Attention Implementation
 End-to-end implementation using only NVIDIA CuTile kernels
-
-Includes FlashAttention optimization for better performance.
 """
 
 import cuda.tile as ct
 import cupy as cp
 import numpy as np
 from typing import Optional, Tuple
-
-# Import FlashAttention
-from flash_attention import flash_attention
-
-# Global flag to enable/disable FlashAttention
-# Baseline: FlashAttention disabled - uses CuPy fallback (einsum-based attention)
-USE_FLASH_ATTENTION = False
 
 
 def get_stream():
@@ -236,15 +227,7 @@ class MultiHeadAttention:
         batch, num_heads, seq_q, head_dim = q.shape
         _, num_kv_heads, seq_k, _ = k.shape
 
-        # V8.2: FlashAttention handles GQA natively - skip expansion to avoid copies
-        # Only expand for non-FlashAttention paths (fallback)
-        if USE_FLASH_ATTENTION and attention_mask is None:
-            # Pass directly to flash_attention which handles GQA via QUERY_GROUP_SIZE
-            return scaled_dot_product_attention(
-                q, k, v, attention_mask, is_causal, self.scale
-            )
-
-        # Fallback path: expand KV for GQA
+        # Expand KV for GQA
         if num_kv_heads != num_heads:
             k = self._expand_kv(k, self.num_queries_per_kv)
             v = self._expand_kv(v, self.num_queries_per_kv)
@@ -254,11 +237,7 @@ class MultiHeadAttention:
         )
 
     def _expand_kv(self, x: cp.ndarray, num_repeats: int) -> cp.ndarray:
-        """Expand KV heads for GQA using broadcast (V6: zero-copy).
-
-        Instead of repeat() which creates a copy, we use reshape + broadcast_to
-        to create a view that can be used directly in FlashAttention.
-        """
+        """Expand KV heads for GQA using broadcast (V6: zero-copy)."""
         batch, num_kv_heads, seq_len, head_dim = x.shape
 
         # V6: Use expand + reshape for zero-copy expansion
@@ -267,8 +246,6 @@ class MultiHeadAttention:
         # -> broadcast to (batch, num_kv_heads, num_repeats, seq_len, head_dim)
         # -> reshape to (batch, num_kv_heads * num_repeats, seq_len, head_dim)
 
-        # Note: broadcast_to creates a view, but FlashAttention needs contiguous
-        # For now, use ascontiguousarray only when needed
         x_expanded = cp.broadcast_to(
             x[:, :, None, :, :],
             (batch, num_kv_heads, num_repeats, seq_len, head_dim)
@@ -313,13 +290,6 @@ def scaled_dot_product_attention(
 
     if scale is None:
         scale = 1.0 / np.sqrt(head_dim)
-
-    # Try FlashAttention first (fastest)
-    if USE_FLASH_ATTENTION and attention_mask is None:
-        try:
-            return flash_attention(q, k, v, scale, causal=is_causal)
-        except Exception as e:
-            pass  # Fall through to other implementations
 
     # Check if dimensions fit CuTile requirements
     seq_k_padded = next_power_of_two(seq_k)

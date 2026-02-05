@@ -48,7 +48,7 @@ show_help() {
     echo "  - Decoder prefill timing"
     echo "  - Per-step decode timing"
     echo "  - Individual layer timing"
-    echo "  - Attention method comparison (standard vs cuBLAS vs FlashAttention)"
+    echo "  - Attention method comparison (standard vs cuBLAS)"
     echo "  - Linear/GEMM method comparison"
 }
 

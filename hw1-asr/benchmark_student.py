@@ -147,7 +147,7 @@ def benchmark_cutile_folder(folder_name, audio_array, num_warmup=1, num_runs=3):
 
     # Clear cached modules
     for mod_name in list(sys.modules.keys()):
-        if mod_name in ['weight_loader', 'model', 'layers', 'attention', 'flash_attention', 'rope', 'conv', 'decode_attention']:
+        if mod_name in ['weight_loader', 'model', 'layers', 'attention', 'rope', 'conv', 'decode_attention']:
             del sys.modules[mod_name]
 
     # Apply version-specific configurations
@@ -158,9 +158,6 @@ def benchmark_cutile_folder(folder_name, audio_array, num_warmup=1, num_runs=3):
         layers.MLP.FUSED = False
         if hasattr(layers, 'AudioMLP'):
             layers.AudioMLP.FUSED = False
-        attention = importlib.import_module("attention")
-        attention.USE_FLASH_ATTENTION = False
-
     print(f"Loading model from {folder_name}...")
     from weight_loader import load_model_from_hf
 
