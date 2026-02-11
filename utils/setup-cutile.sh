@@ -183,6 +183,22 @@ ask_continue "Install CUDA Toolkit via conda?"
 conda install -y nvidia::cuda
 
 # =========================
+# PyTorch (architecture-specific)
+# =========================
+# Install PyTorch BEFORE other CUDA Python packages to prevent
+# accelerate from pulling the wrong torch build from default PyPI.
+echo ">>> Installing PyTorch (architecture-specific)"
+ask_continue "Install PyTorch?"
+
+if [ "${IS_BLACKWELL}" = true ]; then
+	echo "    Installing for Blackwell (sm_120 support)..."
+	pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+else
+	# Non-Blackwell: use stable PyTorch with CUDA 12.4
+	pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
+fi
+
+# =========================
 # Core CUDA Python stack
 # =========================
 echo ">>> Installing CUDA Python stack (CUDA 13)"
@@ -287,20 +303,13 @@ pip install streamlit
 # Audio processing (for ASR tasks)
 pip install soundfile librosa
 
-# PyTorch installation (architecture-specific)
-if [ "${IS_BLACKWELL}" = true ]; then
-	echo ">>> Installing PyTorch nightly for Blackwell (sm_120 support)..."
-	# Blackwell (sm_120) requires PyTorch nightly with CUDA 12.8+
-	pip install --pre torch torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
-
-	# Fix cuda-bindings version conflict
-	# PyTorch nightly installs cuda-bindings 12.x, but cuda-python/cuda-tile need 13.x
-	echo ">>> Fixing cuda-bindings version for cuTile compatibility..."
-	pip install "cuda-bindings~=13.1.1" "cuda-python~=13.1.1" --force-reinstall --quiet
-else
-	# Non-Blackwell: use stable PyTorch with CUDA 12.4
-	pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
-fi
+# =========================
+# Fix cuda-bindings version conflict
+# =========================
+# PyTorch pins cuda-bindings to its bundled version, but cuda-python/cuda-tile
+# need ~=13.1.1. Force 13.1.x last so it isn't overwritten by transitive deps.
+echo ">>> Fixing cuda-bindings version for cuTile compatibility..."
+pip install "cuda-bindings~=13.1.1" "cuda-python~=13.1.1" --force-reinstall --quiet
 
 # =========================
 # Freeze snapshot
@@ -331,7 +340,7 @@ echo
 echo "  HuggingFace & ML:"
 echo "    - transformers, datasets, huggingface_hub, safetensors"
 if [ "${IS_BLACKWELL}" = true ]; then
-	echo "    - torch, torchaudio (nightly, cu128 for Blackwell)"
+	echo "    - torch, torchvision (cu130 for Blackwell)"
 else
 	echo "    - torch, torchaudio (stable, cu124)"
 fi
