@@ -6,12 +6,41 @@ This assignment helps you understand GPU kernel optimization by implementing a s
 
 GLM-ASR is a speech-to-text model that converts audio into text. This HW1 includes Triton and cuTile tracks (example + template) and focuses on performance optimization. **You only need to choose one from this to complete**, which we recommand Triton for its compatability in a lot of hardwares.
 
-## Frameworks
-
 - **Triton**: Example + template implementations (Torch + Triton kernels)
 - **cuTile**: Example + template implementations (CuPy + cuTile kernels)
 
-## Directory Structure
+## Task
+
+### What to Do
+
+Open the template for your track and complete the TODO sections in:
+
+**Triton**
+- `glm_asr_triton_template/attention.py`
+- `glm_asr_triton_template/layers.py`
+- `glm_asr_triton_template/rope.py`
+
+**cuTile**
+- `glm_asr_cutile_template/attention.py`
+- `glm_asr_cutile_template/layers.py`
+- `glm_asr_cutile_template/rope.py`
+
+> [!NOTE]
+> You are not limited to filling the existing TODO kernels. You may refactor and fuse kernels (for example, implement logic that currently spans multiple kernels within a single Triton/cuTile kernel).
+> However, you must implement kernels using Triton/cuTile only (do not use prebuilt operator libraries such as PyTorch).
+
+### Grading Criteria
+
+| Criteria | Points |
+|----------|--------|
+| Correctness (transcription accuracy > 80%) | 60 |
+| Performance (faster than baseline) | 30 |
+| Code quality | 10 |
+
+
+## Description
+
+### Directory Structure
 
 ```
 student_version/
@@ -44,18 +73,36 @@ student_version/
 | `glm_asr_triton_template` | Triton template (TODO kernels) |
 | `glm_asr_cutile_template` | cuTile template (TODO kernels) |
 
+### Key Files Explained
+
+- **layers.py**: Basic neural network layers (Linear, LayerNorm, MLP)
+- **attention.py**: Self-attention mechanism
+- **rope.py**: Rotary Position Embedding (RoPE) for position encoding
+- **model.py**: Full model architecture (AudioEncoder, TextDecoder)
+- **weight_loader.py**: Loads pre-trained weights (no changes needed)
+
 ## Quick Start
 
 Choose a track below (Triton first).
 
-### Triton Track
+### Environment Setup
 
-Environment setup (from repo root):
+From the repo root, source the setup script for your chosen track:
+
 ```bash
+# Triton track
 source utils/setup-triton.sh
 # Optional: demo deps (if not already installed)
 # pip install transformers huggingface_hub streamlit soundfile scipy
+
+# cuTile track
+source utils/setup-cutile.sh
 ```
+
+`setup-cutile.sh` installs common ML tooling used by the demo:
+`transformers`, `huggingface_hub`, `streamlit`, `soundfile`, `scipy`.
+
+### Triton Track
 
 1. Test reference implementation:
 ```bash
@@ -79,14 +126,6 @@ streamlit run demo.py
 
 ### cuTile Track
 
-Environment setup (from repo root):
-```bash
-source utils/setup-cutile.sh
-```
-
-`setup-cutile.sh` installs common ML tooling used by the demo:
-`transformers`, `huggingface_hub`, `streamlit`, `soundfile`, `scipy`.
-
 1. Test reference implementation:
 ```bash
 ./benchmark.sh glm_asr_cutile_example
@@ -107,47 +146,13 @@ source utils/setup-cutile.sh
 streamlit run demo.py
 ```
 
-Expected output:
+### Expected Output
+
 ```
 Transcription: Concord returned to its place amidst the tents.
 Accuracy: 100.0%
 Status: PASS
 ```
-
-## Your Task
-
-Open the template for your track and complete the TODO sections in:
-
-**Triton**
-- `glm_asr_triton_template/attention.py`
-- `glm_asr_triton_template/layers.py`
-- `glm_asr_triton_template/rope.py`
-
-**cuTile**
-- `glm_asr_cutile_template/attention.py`
-- `glm_asr_cutile_template/layers.py`
-- `glm_asr_cutile_template/rope.py`
-
-> [!NOTE]
-> You are not limited to filling the existing TODO kernels. You may refactor and fuse kernels (for example, implement logic that currently spans multiple kernels within a single Triton/cuTile kernel). 
-> However, you must implement kernels using Triton/cuTile only (do not use prebuilt operator libraries such as PyTorch).
-
-
-### Key Files Explained
-
-- **layers.py**: Basic neural network layers (Linear, LayerNorm, MLP)
-- **attention.py**: Self-attention mechanism
-- **rope.py**: Rotary Position Embedding (RoPE) for position encoding
-- **model.py**: Full model architecture (AudioEncoder, TextDecoder)
-- **weight_loader.py**: Loads pre-trained weights (no changes needed)
-
-## Grading Criteria
-
-| Criteria | Points |
-|----------|--------|
-| Correctness (transcription accuracy > 80%) | 60 |
-| Performance (faster than baseline) | 30 |
-| Code quality | 10 |
 
 ## Benchmark Tools
 
