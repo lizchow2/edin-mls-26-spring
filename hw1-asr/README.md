@@ -1,15 +1,20 @@
+
 # GLM-ASR Student Assignment
 
 This assignment helps you understand GPU kernel optimization by implementing a speech recognition model using Triton and NVIDIA cuTile.
 
-> **New here?** Read the **[Detailed Student Guide (GUIDE.md)](GUIDE.md)** for a step-by-step walkthrough, kernel patterns, and troubleshooting tips.
-
 ## Overview
 
-GLM-ASR is a speech-to-text model that converts audio into text. This HW1 includes Triton and cuTile tracks (example + template) and focuses on performance optimization. **You only need to choose one from this to complete**, which we recommand Triton for its compatability in a lot of hardwares.
+GLM-ASR is a speech-to-text model that converts audio into text. This HW1 includes Triton and cuTile tracks (example + template) and focuses on performance optimization. **You only need to choose Triton/cuTile to complete**, which we recommand Triton for its compatability in a lot of hardwares.
 
-- **Triton**: Example + template implementations (Torch + Triton kernels)
-- **cuTile**: Example + template implementations (CuPy + cuTile kernels)
+What you will learn in this HW:
+
+- **GPU kernel optimization** fundamentals
+- **Writing Triton kernels** for neural network workloads
+- **Writing NVIDIA cuTile kernels** as an alternative track
+- **Performance optimization** techniques for GPU-based inference
+
+> **New here?** Read the **[Detailed Student Guide (GUIDE.md)](GUIDE.md)** for a step-by-step walkthrough, kernel patterns, and troubleshooting tips.
 
 ## Task
 
@@ -33,12 +38,49 @@ Open the template for your track and complete the TODO sections in:
 
 ### Grading Criteria
 
-| Criteria | Points |
-|----------|--------|
-| Correctness (transcription accuracy > 80%) | 60 |
-| Performance (faster than baseline) | 30 |
-| Code quality | 10 |
+> [!NOTE]
+> This is **not** a competition. The absolute performance of your implementation is not the most important factor. We care more about your **analysis and reasoning** about performance.
 
+Your grade will be based on your **report**, evaluated across the following dimensions:
+
+1. **Implementation Summary** — Briefly describe which kernels you implemented and any design decisions (e.g., block sizes, fusion strategies).
+2. **Performance Profiling** — Use `benchmark_detailed.sh` or `nsys` to collect profiling data. Present results with tables or charts.
+3. **Bottleneck Analysis** — Identify the performance bottlenecks of your kernels. Discuss whether each kernel is compute-bound or memory-bound, and why.
+4. **Optimization Attempts** — Describe at least one optimization you attempted (successful or not). Explain your hypothesis, what you changed, and the observed effect.
+5. **Comparison** — Compare your implementation against the provided baseline. Analyze the differences and explain the root causes.
+
+> [!TIP]
+> A well-reasoned report that explains a modest speedup will score higher than a fast implementation with no analysis.
+
+## QuickStart
+
+### Triton Version QuickStart
+
+From the **repository root** (one level above `hw1-asr/`):
+
+```bash
+# Installation: set up Triton environment from the repository root (one level above hw1-asr/)
+source utils/setup-triton.sh
+
+# Verify the environment works by running the reference baseline
+./benchmark.sh glm_asr_triton_example
+
+# After you fill your code in the template, run the end-to-end test
+./benchmark.sh glm_asr_triton_template
+```
+
+### cuTile Version QuickStart
+
+```bash
+# Installation: set up cuTile environment from the repository root (one level above hw1-asr/)
+source utils/setup-cutile.sh
+
+# Verify the environment works by running the reference baseline
+./benchmark.sh glm_asr_cutile_example
+
+# After you fill your code in the template, run the end-to-end test
+./benchmark.sh glm_asr_cutile_template
+```
 
 ## Description
 
@@ -47,9 +89,9 @@ Open the template for your track and complete the TODO sections in:
 ```
 student_version/
 ├── glm_asr_triton_example/     # Reference: Triton baseline (Torch + Triton)
-├── glm_asr_triton_template/    # YOUR WORK: Complete the TODOs here (Triton)
+├── glm_asr_triton_template/    # YOUR WORK OPTION 1: Complete the TODOs here (Triton)
 ├── glm_asr_cutile_example/     # Reference: Example baseline (Initial CuPy + cuTile)
-├── glm_asr_cutile_template/    # YOUR WORK: Complete the TODOs here (cuTile)
+├── glm_asr_cutile_template/    # YOUR WORK OPTION 2: Complete the TODOs here (cuTile)
 ├── glm_asr_scratch/            # Reference: PyTorch baseline
 ├── demo.py                    # Streamlit interactive demo
 ├── benchmark.sh               # Shell wrapper for benchmark_student.py
@@ -70,8 +112,8 @@ student_version/
 
 ### Student Templates
 
-| Version | Description |
-|---------|-------------|
+| Version                   | Description                    |
+| ------------------------- | ------------------------------ |
 | `glm_asr_triton_template` | Triton template (TODO kernels) |
 | `glm_asr_cutile_template` | cuTile template (TODO kernels) |
 
@@ -107,21 +149,25 @@ source utils/setup-cutile-fix.sh
 ### Triton Track
 
 1. Test reference implementation:
+
 ```bash
 ./benchmark.sh glm_asr_triton_example
 ```
 
 2. Test your implementation:
+
 ```bash
 ./benchmark.sh glm_asr_triton_template
 ```
 
 3. Check performance:
+
 ```bash
 ./benchmark_detailed.sh glm_asr_triton_template
 ```
 
 4. Try interactive demo:
+
 ```bash
 streamlit run demo.py
 ```
@@ -129,21 +175,25 @@ streamlit run demo.py
 ### cuTile Track
 
 1. Test reference implementation:
+
 ```bash
 ./benchmark.sh glm_asr_cutile_example
 ```
 
 2. Test your implementation:
+
 ```bash
 ./benchmark.sh glm_asr_cutile_template
 ```
 
 3. Check performance:
+
 ```bash
 ./benchmark_detailed.sh glm_asr_cutile_template
 ```
 
 4. Try interactive demo:
+
 ```bash
 streamlit run demo.py
 ```
@@ -222,9 +272,11 @@ streamlit run demo.py
 Select from: `Triton Example (Baseline)`, `Triton Template`, `CuTile Example (Baseline)`, `CuTile Template`, `Scratch (PyTorch)`
 
 ### Check the WebUI of your slurm job on your PC
+
 First, check the port from the output of `streamlit run demo.py`.
 
 Then, you are using slurm, run `show_tunnel.sh` on your **login node/head node**. The script will scan your running jobs to get the node name (the first running job).
+
 ```bash
 bash show_tunnel.sh <port>
 ```
@@ -245,11 +297,13 @@ In the output of `show_tunnel.sh`, you will get the instruction of running a spe
    - `cp.exp()`, `cp.sqrt()` - Element-wise operations
 
 4. **Check shapes**: Print tensor shapes when debugging:
+
    ```python
    print(f"x.shape = {x.shape}")
    ```
 
 5. **Understand the data flow**:
+
    ```
    Audio (wav) → AudioEncoder → Projector → TextDecoder → Text
    ```
