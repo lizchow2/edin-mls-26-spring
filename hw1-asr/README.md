@@ -1,4 +1,3 @@
-
 # GLM-ASR Student Assignment
 
 This assignment helps you understand GPU kernel optimization by implementing a speech recognition model using Triton and NVIDIA cuTile.
@@ -33,22 +32,6 @@ Open the template for your track and complete the TODO sections in:
 > [!NOTE]
 > You are not limited to filling the existing TODO kernels. You may refactor and fuse kernels (for example, implement logic that currently spans multiple kernels within a single Triton/cuTile kernel).
 > However, you must implement kernels using Triton/cuTile only (do not use prebuilt operator libraries such as PyTorch).
-
-### Grading Criteria
-
-> [!NOTE]
-> This is **not** a competition. The absolute performance of your implementation is not the most important factor. We care more about your **analysis and reasoning** about performance.
-
-Your grade will be based on your **report**, evaluated across the following dimensions:
-
-1. **Implementation Summary** — Briefly describe which kernels you implemented and any design decisions (e.g., block sizes, fusion strategies).
-2. **Performance Profiling** — Use `benchmark_detailed.sh` or `nsys` to collect profiling data. Present results with tables or charts.
-3. **Bottleneck Analysis** — Identify the performance bottlenecks of your kernels. Discuss whether each kernel is compute-bound or memory-bound, and why.
-4. **Optimization Attempts** — Describe at least one optimization you attempted (successful or not). Explain your hypothesis, what you changed, and the observed effect.
-5. **Comparison** — Compare your implementation against the provided baseline. Analyze the differences and explain the root causes.
-
-> [!TIP]
-> A well-reasoned report that explains a modest speedup will score higher than a fast implementation with no analysis.
 
 ## QuickStart
 
@@ -104,11 +87,16 @@ student_version/
 
 ### Reference Implementations
 
-| Version | Description |
-|---------|-------------|
-| `glm_asr_triton_example` | Baseline: Torch + Triton |
-| `glm_asr_cutile_example` | Baseline: Pure CuPy |
-| `glm_asr_scratch` | PyTorch reference implementation |
+| Version                  | Description                                                                   |
+| ------------------------ | ----------------------------------------------------------------------------- |
+| `glm_asr_scratch`        | PyTorch Reference: explicitly shows model structure (for understanding only)  |
+| `glm_asr_triton_example` | Triton Baseline: use this as your reference if you chose the **Triton** track |
+| `glm_asr_cutile_example` | cuTile Baseline: use this as your reference if you chose the **cuTile** track |
+
+> [!IMPORTANT]
+> Match your reference to your track:
+> - **Triton track** → study `glm_asr_triton_example/` as your baseline
+> - **cuTile track** → study `glm_asr_cutile_example/` as your baseline
 
 ### Student Templates
 
@@ -116,6 +104,22 @@ student_version/
 | ------------------------- | ------------------------------ |
 | `glm_asr_triton_template` | Triton template (TODO kernels) |
 | `glm_asr_cutile_template` | cuTile template (TODO kernels) |
+
+> [!IMPORTANT]
+> **Minimum optimization requirements (choose your track: Triton or cuTile).**  
+> Your submission should include **at least these 3 optimizations** (we will check them during grading/report review):
+>
+> 1. **Adjust tile/block sizes**  
+>    - Tune key tiling hyperparameters (e.g., `BLOCK_M/BLOCK_N/BLOCK_K`, `num_warps`, `num_stages` in Triton; the corresponding tile shapes / scheduling params in cuTile).  
+>    - Show you tried **at least 2–3 configurations** and picked the best for your GPU.
+>
+> 2. **Kernel fusion (at least 1 fused kernel)**  
+>    - Fuse two or more ops that are currently separate.  
+>    - The goal is to reduce intermediate reads/writes and kernel launch overhead.
+>
+> 3. **FlashAttention-style attention**  
+>    - Implement a **FlashAttention** (or FlashAttention-like) kernel for the self-attention path (streaming softmax with good memory efficiency, blockwise QK^T, numerically stable softmax, then multiply by V).  
+>    - You may refactor `attention.py` as needed, but must keep reuslts correctness.
 
 ### Key Files Explained
 
