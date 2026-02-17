@@ -100,7 +100,23 @@ sbatch --gres=gpu:1 test.sh
 
 * You can verify the output using `cat slurm-[ID].out`.
 
+#### Memory Allocation Note (Why is my program killed during model weight loading?)
 
+By default, the Teaching cluster may allocate ~8GB of RAM if ```--mem``` is not explicitly specified.
+
+Therefore, when running benchmark.sh without specifying the memory requirement, you may find your job be killed due to insufficient RAM, especially during model weight loading.
+
+To avoid this out-of-memory issue, please explicitly set the memory requirement when submitting the job. For example:
+
+```bash
+srun -p Teaching -w saxa --gres gpu:1 --mem=16G --pty bash
+```
+
+or in the sbatch script:
+
+```bash
+#SBATCH --mem=16G
+```
 
 ---
 
