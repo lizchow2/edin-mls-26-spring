@@ -66,6 +66,21 @@ def attention_scores_kernel(
     pass
 
 
+"""
+This is used inside attention to normalise the scores matrix (Q·Kᵀ). 
+It reads and writes back to the same tensor (scores_ptr). 
+
+Pesudocode:
+row = get(row)
+max = max(row)
+sum = 0
+for all num in row: 
+  if -inf then 0 else num -= max, exp(num), sum += num
+for all in row:
+ num /= sum
+write back row
+"""
+
 @triton.jit
 def softmax_inplace_kernel(scores_ptr, stride_s, seq_k, BLOCK_SIZE: tl.constexpr):
     """
@@ -83,7 +98,19 @@ def softmax_inplace_kernel(scores_ptr, stride_s, seq_k, BLOCK_SIZE: tl.constexpr
     # Step 3: Compute exp and normalize
     # Step 4: Store back
 
-    # YOUR CODE HERE
+    row_start = scores_ptr + row * stride_s
+    columns = tl.arange(0, BLOCK_SIZE)
+    mask = columns < seq_k # Only load up to seq_k columns
+    values = tl.load(row_start + columns, mask=mask, other=float('-inf'))
+
+    max_value = tl.max(values, axis=0)
+    values = values - max_value
+
+    values = tl.exp(values)
+    sum_values = tl.sum(values, axis=0)
+    values = values / sum_values
+
+    tl.store(scores_ptr + row * stride_s + columns, values, mask=mask)
     pass
 
 
