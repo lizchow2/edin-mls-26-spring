@@ -111,7 +111,6 @@ def softmax_inplace_kernel(scores_ptr, stride_s, seq_k, BLOCK_SIZE: tl.constexpr
     values = values / sum_values
 
     tl.store(scores_ptr + row * stride_s + columns, values, mask=mask)
-    pass
 
 
 @triton.jit

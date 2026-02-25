@@ -329,7 +329,9 @@ def embedding_kernel(
     )
     tl.store(output_ptr + pid0 * stride_out0 + offs, w, mask=mask)
 
-
+"""
+General purpose softmax kernel with two pointers
+"""
 @triton.jit
 def softmax_kernel(x_ptr, y_ptr, stride_x, stride_y, n_cols, BLOCK_SIZE: tl.constexpr):
     """
@@ -348,8 +350,20 @@ def softmax_kernel(x_ptr, y_ptr, stride_x, stride_y, n_cols, BLOCK_SIZE: tl.cons
     # Step 3: Compute exp and normalize
     # Step 4: Store output
 
-    # YOUR CODE HERE
-    pass
+    read_row = x_ptr + row * stride_x
+    write_row = y_ptr + row * stride_y
+    columns = tl.arange(0, BLOCK_SIZE)
+    mask = columns < n_cols
+    values = tl.load(read_row + columns, mask=mask, other=float('-inf'))
+
+    max = tl.max(values, axis=0)
+    values = values - max
+
+    values = tl.exp(values)
+    sum = tl.sum(values, axis=0)
+    values = values / sum
+
+    tl.store(write_row + columns, values, mask=mask)
 
 
 @triton.jit
