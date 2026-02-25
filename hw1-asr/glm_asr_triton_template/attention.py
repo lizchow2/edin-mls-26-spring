@@ -62,8 +62,30 @@ def attention_scores_kernel(
     # Step 3: Compute dot-product scores and scale
     # Step 4: Store scores
 
-    # YOUR CODE HERE
-    pass
+    q_start_ptr = q_ptr + (pid_bh * stride_q0) + (pid_q * stride_q1)
+    offs_d = tl.arange(0,BLOCK_D)
+    q_ptrs = q_start_ptr + (offs_d[None,:] * stride_q2)
+
+    mask_q = offs_d[None,:] < head_dim #ngl it would be really useful if they added some comments on these parameters like wow
+    q_vector = tl.load(q_ptrs, mask=mask_q)
+
+    #now lets build the k vector 
+    for start_k in range(0, seq_k, BLOCK_K): #we need to iterate over the key dimension in blocks of BLOCK_K
+        k_block_ptr = k_ptr + (pid_bh * stride_k0) + (start_k * stride_k1) #we are still in the same batch head, but now we are at the start of the block of keys
+        offs_k = tl.arange(0, BLOCK_K) #now we are iterating over the key dimension in the block
+        k_ptrs = k_block_ptr + (offs_k[:,None] * stride_k1) + (offs_d[None,:] * stride_k2) #we need to add the offset for the key dimension and the head dimension
+
+        actual_k = start_k + offs_k 
+        mask_k = (actual_k[:, None] < seq_k) & (offs_d[None, :] < head_dim) #we need to make sure we are within the bounds of the key dimension and the head dimension
+        k_vector = tl.load(k_ptrs, mask=mask_k)
+
+        #now we have the q vector and the k vector, we can compute the dot product and scale it
+        scores = tl.sum(q_vector * k_vector, axis=1) * scale
+
+        # Step 4: Store scores (Using 1D pointers because `tl.sum` makes the output 1D)
+        s_ptrs = scores_ptr + (pid_bh * stride_s0) + (pid_q * stride_s1) + (actual_k * stride_s2)
+        mask_s = actual_k < seq_k
+        tl.store(s_ptrs, scores, mask=mask_s)
 
 
 @triton.jit

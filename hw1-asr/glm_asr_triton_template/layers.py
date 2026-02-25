@@ -136,7 +136,6 @@ def silu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
 
     *** TODO: Implement this kernel ***
     """
-    pid = tl.program_id(0)
 
     # ============================================================================
     # TODO: Implement SiLU kernel
@@ -147,7 +146,19 @@ def silu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     # Step 3: Multiply and store
 
     # YOUR CODE HERE
-    pass
+    pid = tl.program_id(0) #kernels run as a grid of program instances. This id is the program id along axis 0
+    #if we had a 2d grid (matrix), we would have a program_id(1) for y
+
+
+    
+    offs = pid * BLOCK_SIZE + tl.arange(0,BLOCK_SIZE) #creates the range that is going to be processed (pid*blocksize + 1, pid*blocksize + 2,...)
+
+    mask = offs < n_elements #boolean mask to check if the offset is within the bounds of the input array
+
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0) #load the input values from memory using the offsets and the mask
+    y = x / (1 + tl.exp(-x)) #compute the SiLU function using the loaded input values
+    tl.store(y_ptr + offs, y, mask=mask) #store the computed values back to memory using the offsets and the mask
+
 
 
 @triton.jit
