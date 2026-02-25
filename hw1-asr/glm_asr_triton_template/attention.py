@@ -148,8 +148,18 @@ def attention_output_kernel(
     # Step 3: Compute weighted sum
     # Step 4: Store output
 
-    # YOUR CODE HERE
-    pass
+    offset_row_k = tl.arange(0, BLOCK_K)
+    offset_col_d = tl.arange(0, BLOCK_D)
+    mask_weights = offset_row_k < seq_k
+    weights = tl.load(attn_ptr + pid_bh * stride_w0 + pid_q * stride_w1 + offset_row_k * stride_w2, mask=mask_weights, other=0.0)
+
+    mask_values = (offset_row_k[:, None] < seq_k) & (offset_col_d[None, :] < head_dim)
+    values = tl.load(v_ptr + pid_bh * stride_v0 + offset_row_k[:, None] * stride_v1 + offset_col_d[None, :] * stride_v2, mask=mask_values, other=0.0)
+
+    weighted_sum = tl.sum(values * weights[:, None], axis=0)
+
+    mask_store = offset_col_d < head_dim
+    tl.store(output_ptr + pid_bh * stride_o0 + pid_q * stride_o1 + offset_col_d * stride_o2, weighted_sum, mask=mask_store)
 
 
 @triton.jit
