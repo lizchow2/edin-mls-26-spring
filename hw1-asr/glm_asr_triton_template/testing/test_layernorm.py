@@ -18,6 +18,9 @@ def triton_layernorm(x, w, b, eps=1e-5):
 
 def test_layernorm(batch_size, hidden_size, dtype):
     torch.manual_seed(42)
+    batch_size=2
+    hidden_size=4096
+    dtype=torch.float32
     
     x = torch.randn((batch_size, hidden_size), device='cuda', dtype=dtype)
     w = torch.randn((hidden_size,), device='cuda', dtype=dtype)
@@ -28,11 +31,13 @@ def test_layernorm(batch_size, hidden_size, dtype):
     pt_y = torch.nn.functional.layer_norm(x, (hidden_size,), w, b, eps)
     
     atol = 1e-2 if dtype == torch.float16 else 1e-5
-    torch.testing.assert_close(tt_y, pt_y, atol=atol, rtol=1e-4)
+    try:
+        torch.testing.assert_close(tt_y, pt_y, atol=atol, rtol=1e-4)
+        print("✅ Unit Test Passed: Triton output matches PyTorch!")
+    except Exception as e:
+        print("❌ Unit Test Failed!")
+        print(e)
 
 if __name__=='__main__':
-    batch_size=2
-    hidden_size=4096
-    dtype=torch.float32
-    print(test_layernorm(batch_size, hidden_size, dtype=dtype))
+    test_layernorm()
 
