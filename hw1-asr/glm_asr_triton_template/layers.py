@@ -105,7 +105,20 @@ def layernorm_kernel(
     # Step 5: Normalize and apply affine transform
 
     # YOUR CODE HERE
-    pass
+    offs = tl.arange(0, BLOCK_SIZE)
+    mask = offs < hidden_size
+    
+    x = tl.load(x_ptr + pid * stride_x + offs, mask=mask, other=0.0).to(tl.float32)
+    sum_x = tl.sum(x, axis=0)
+    sum_x2 = tl.sum(x * x, axis=0)
+    mean = sum_x / hidden_size
+    var = (sum_x2 / hidden_size)- (mean * mean)
+    var = tl.maximum(var, 0.0)
+    rstd = tl.rsqrt(var + eps)
+    w = tl.load(w_ptr + offs, mask=mask, other=0.0)
+    b = tl.load(b_ptr + offs, mask=mask, other=0.0)
+    y = (x - mean) * rstd * w + B
+    tl.store(y_ptr + pid * stride_y + offs, mask=mask)
 
 
 @triton.jit
