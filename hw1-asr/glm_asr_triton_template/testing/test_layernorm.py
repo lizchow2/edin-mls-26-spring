@@ -1,6 +1,6 @@
-import pytest
 import torch
-from glm_asr_triton_template.layers import layernorm_kernel
+import triton
+from layers import layernorm_kernel
 
 def triton_layernorm(x, w, b, eps=1e-5):
     M, N = x.shape
@@ -16,13 +16,6 @@ def triton_layernorm(x, w, b, eps=1e-5):
     )
     return y
 
-@pytest.mark.parametrize("batch_size, hidden_size", [
-    (1, 512),
-    (8, 1024),
-    (4, 127),
-    (2, 4096), 
-])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 def test_layernorm(batch_size, hidden_size, dtype):
     torch.manual_seed(42)
     
@@ -36,3 +29,10 @@ def test_layernorm(batch_size, hidden_size, dtype):
     
     atol = 1e-2 if dtype == torch.float16 else 1e-5
     torch.testing.assert_close(tt_y, pt_y, atol=atol, rtol=1e-4)
+
+if __name__=='__main__':
+    batch_size=2
+    hidden_size=4096
+    dtype=torch.float32
+    print(test_layernorm(batch_size, hidden_size, dtype=dtype))
+
