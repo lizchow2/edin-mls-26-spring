@@ -109,16 +109,17 @@ def layernorm_kernel(
     mask = offs < hidden_size
     
     x = tl.load(x_ptr + pid * stride_x + offs, mask=mask, other=0.0).to(tl.float32)
-    sum_x = tl.sum(x, axis=0)
-    sum_x2 = tl.sum(x * x, axis=0)
-    mean = sum_x / hidden_size
-    var = (sum_x2 / hidden_size)- (mean * mean)
-    var = tl.maximum(var, 0.0)
+    w = tl.load(w_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    b = tl.load(b_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    
+    mean = tl.sum(x, axis=0) / hidden_size
+    x_centered = tl.where(mask, x - mean, 0.0)
+    var = tl.sum(x_centered * x_centered, axis=0) / hidden_size
     rstd = tl.rsqrt(var + eps)
-    w = tl.load(w_ptr + offs, mask=mask, other=0.0)
-    b = tl.load(b_ptr + offs, mask=mask, other=0.0)
-    y = (x - mean) * rstd * w + B
-    tl.store(y_ptr + pid * stride_y + offs, mask=mask)
+    
+    y = x_centered * rstd * w + b
+    
+    tl.store(y_ptr + pid * stride_y + offs, y, mask=mask)
 
 
 @triton.jit
