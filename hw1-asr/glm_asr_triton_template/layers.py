@@ -70,7 +70,20 @@ def rmsnorm_kernel(
     # Step 4: Apply weight and store
 
     # YOUR CODE HERE
-    pass
+
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < hidden_size
+    input_ptr = x_ptr + pid * stride_x + cols
+
+    x = tl.load(input_ptr, mask=mask, other=0.0).to(tl.float32)
+    w = tl.load(w_ptr + cols, mask=mask)
+    
+    var = tl.sum(x * x, axis=0) / hidden_size
+    rstd = 1 / tl.sqrt(var + eps)
+    y = x * rstd * w
+
+    output_ptr = y_ptr + pid * stride_y + cols
+    tl.store(output_ptr, y, mask=mask)
 
 
 @triton.jit
