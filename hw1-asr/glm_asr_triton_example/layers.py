@@ -92,6 +92,12 @@ def layernorm_kernel(
     y = x_norm * w + b
     tl.store(y_ptr + pid * stride_y + offs, y, mask=mask)
 
+@triton.jit
+def combine_fn(a, b):
+    # a and b are tuples: (sum, sum_squares)
+    sum_a, sum2_a = a
+    sum_b, sum2_b = b
+    return sum_a + sum_b, sum2_a + sum2_b
 
 @triton.jit
 def gelu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
