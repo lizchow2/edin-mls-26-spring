@@ -39,7 +39,7 @@ def next_power_of_two(x: int) -> int:
 # ============================================================================
 # Triton Kernels
 # ============================================================================
-
+# <logic-sync>
 @triton.jit
 def rmsnorm_kernel(
     x_ptr,
@@ -84,7 +84,39 @@ def rmsnorm_kernel(
 
     output_ptr = y_ptr + pid * stride_y + cols
     tl.store(output_ptr, y, mask=mask)
+# </logic-sync>
 
+import triton
+import triton.language as tl
+
+@triton.jit
+def fused_residual_rmsnorm_kernel(
+    X_ptr,         
+    Res_ptr,       
+    W_ptr,         
+    Norm_Out_ptr, 
+    stride,        
+    N_cols,        
+    eps,         
+    BLOCK_SIZE: tl.constexpr,
+):
+    row_idx = tl.program_id(0)
+    cols = tl.arange(0, BLOCK_SIZE)
+    mask = cols < N_cols
+    
+    x = tl.load(X_ptr + row_idx * stride + cols, mask=mask, other=0.0)
+    res = tl.load(Res_ptr + row_idx * stride + cols, mask=mask, other=0.0)
+
+    combined = x + res
+    
+    tl.store(X_ptr + row_idx * stride + cols, combined, mask=mask)
+    
+    var = tl.sum(combined * combined, axis=0) / N_cols
+    rstd = tl.math.rsqrt(var + eps)
+    
+    w = tl.load(W_ptr + cols, mask=mask)
+    norm_out = (combined * rstd) * w
+    tl.store(Norm_Out_ptr + row_idx * stride + cols, norm_out, mask=mask)
 
 @triton.jit
 def layernorm_kernel(
@@ -580,6 +612,27 @@ class RMSNorm:
             self.weight = self.weight.to(x.device)
         return (self.weight * x_normed).to(x.dtype)
 
+class FusedResidualRMSNorm:
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        self.hidden_size = hidden_size
+        self.eps = eps
+        self.weight = torch.nn.Parameter(torch.ones(hidden_size))
+
+    def __call__(self, x: torch.Tensor, residual_to_add: torch.Tensor) -> torch.Tensor:
+        M, N = x.view(-1, x.shape[-1]).shape
+        norm_out = torch.empty_like(x)
+        
+        grid = (M,)
+        block = triton.next_power_of_2(self.hidden_size)
+        
+        fused_residual_rmsnorm_kernel[grid](
+            x, residual_to_add, self.weight, norm_out,
+            N, N, self.eps,
+            BLOCK_SIZE=block,
+            num_warps=8,
+            num_stages=4 
+        )
+        return norm_out
 
 class LayerNorm:
     """Layer Normalization using Triton with Torch fallback."""
