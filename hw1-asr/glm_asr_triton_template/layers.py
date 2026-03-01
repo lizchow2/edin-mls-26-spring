@@ -115,6 +115,64 @@ def fused_residual_rmsnorm_kernel(
     norm_out = (combined * rstd) * w
     tl.store(Norm_Out_ptr + row_idx * stride + cols, norm_out, mask=mask)
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_K': 128}, num_warps=8, num_stages=3),
+    ],
+    key=['M', 'K'], 
+)
+@triton.jit
+def final_fused_qkv_kernel(
+    x_ptr, w_norm_ptr, w_qkv_ptr, 
+    q_ptr, k_ptr, v_ptr,
+    stride_xm, stride_xk,
+    stride_qkv_k, stride_qkv_n,
+    M, K, N_Q, N_KV, eps,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """2D Parallel Fused Kernel"""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    total_n = N_Q + 2 * N_KV
+
+    # 1. Compute RMS Norm
+    var = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    for k in range(0, K, BLOCK_K):
+        rk = k + tl.arange(0, BLOCK_K)
+        x = tl.load(x_ptr + rm[:, None] * stride_xm + rk[None, :] * stride_xk, 
+                    mask=(rm[:, None] < M) & (rk[None, :] < K), other=0.0).to(tl.float32)
+        var += tl.sum(x * x, axis=1)
+    rsqrt_var = tl.rsqrt(var / K + eps)
+
+    # 2. Parallel Matrix Multiplication
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(0, K, BLOCK_K):
+        rk = k + tl.arange(0, BLOCK_K)
+        x = tl.load(x_ptr + rm[:, None] * stride_xm + rk[None, :] * stride_xk,
+                    mask=(rm[:, None] < M) & (rk[None, :] < K), other=0.0).to(tl.float32)
+        w_norm = tl.load(w_norm_ptr + rk, mask=rk < K, other=0.0)
+        
+        x_norm = (x * rsqrt_var[:, None]) * w_norm[None, :]
+        
+        w_val = tl.load(w_qkv_ptr + rk[:, None] * stride_qkv_k + rn[None, :] * stride_qkv_n,
+                        mask=(rk[:, None] < K) & (rn[None, :] < total_n), other=0.0)
+        acc += tl.dot(x_norm.to(tl.float16), w_val.to(tl.float16))
+
+    n_start = pid_n * BLOCK_N
+    mask = (rm[:, None] < M) & (rn[None, :] < total_n)
+    if n_start < N_Q:
+        tl.store(q_ptr + rm[:, None] * N_Q + (rn[None, :] - 0), acc, mask=mask)
+    elif n_start < N_Q + N_KV:
+        tl.store(k_ptr + rm[:, None] * N_KV + (rn[None, :] - N_Q), acc, mask=mask)
+    else:
+        tl.store(v_ptr + rm[:, None] * N_KV + (rn[None, :] - (N_Q + N_KV)), acc, mask=mask)
+
 @triton.jit
 def layernorm_kernel(
     x_ptr,
@@ -636,6 +694,37 @@ class FusedResidualRMSNorm:
             num_stages=4 
         )
         return norm_out
+
+class FusedRMSNormQKV:
+    def __init__(self, hidden_size, num_heads, num_kv_heads, head_dim, eps=1e-6):
+        self.hidden_size = hidden_size
+        self.eps = eps
+        self.q_out = num_heads * head_dim
+        self.kv_out = num_kv_heads * head_dim
+        self.total_out = self.q_out + 2 * self.kv_out
+        self.norm_weight = torch.ones(hidden_size, dtype=torch.float32)
+        self.qkv_weight = torch.zeros((hidden_size, self.total_out), dtype=torch.float32)
+
+    def __call__(self, x: torch.Tensor):
+        M = int(np.prod(x.shape[:-1]))
+        K = self.hidden_size
+        
+        q = torch.empty((M, self.q_out), device=x.device, dtype=x.dtype)
+        k = torch.empty((M, self.kv_out), device=x.device, dtype=x.dtype)
+        v = torch.empty((M, self.kv_out), device=x.device, dtype=x.dtype)
+        
+        grid = lambda META: (
+            triton.cdiv(M, META['BLOCK_M']),
+            triton.cdiv(self.total_out, META['BLOCK_N'])
+        )
+        
+        final_fused_qkv_kernel[grid](
+            x_ptr=x, w_norm_ptr=self.norm_weight, w_qkv_ptr=self.qkv_weight,
+            q_ptr=q, k_ptr=k, v_ptr=v,
+            stride_xm=K, stride_xk=1, stride_qkv_k=self.total_out, stride_qkv_n=1,
+            M=M, K=K, N_Q=self.q_out, N_KV=self.kv_out, eps=self.eps
+        )
+        return q.reshape(*x.shape[:-1], -1), k.reshape(*x.shape[:-1], -1), v.reshape(*x.shape[:-1], -1)
 
 class LayerNorm:
     """Layer Normalization using Triton with Torch fallback."""

@@ -11,7 +11,7 @@ from dataclasses import dataclass
 # Import Triton components
 from layers import (
     RMSNorm, LayerNorm, Linear, Embedding, MLP,
-    gelu, silu, softmax, get_stream
+    gelu, silu, softmax, get_stream, FusedRMSNormQKV
 )
 from rope import RotaryEmbedding, apply_rotary_pos_emb
 from attention import scaled_dot_product_attention, MultiHeadAttention
@@ -222,13 +222,16 @@ class DecoderLayer:
         self.rope = rope
 
         # Layer norms
-        self.input_layernorm = RMSNorm(hidden_size)
+        # self.input_layernorm = RMSNorm(hidden_size) # removed for fused version
+        self.fused_qkv = FusedRMSNormQKV(
+            hidden_size, num_heads, num_kv_heads, self.head_dim
+        )
         self.post_attention_layernorm = RMSNorm(hidden_size)
 
         # Attention projections (no bias for Llama-style)
-        self.q_proj = Linear(hidden_size, num_heads * self.head_dim, bias=False)
-        self.k_proj = Linear(hidden_size, num_kv_heads * self.head_dim, bias=False)
-        self.v_proj = Linear(hidden_size, num_kv_heads * self.head_dim, bias=False)
+        # self.q_proj = Linear(hidden_size, num_heads * self.head_dim, bias=False) # removed for fused version
+        # self.k_proj = Linear(hidden_size, num_kv_heads * self.head_dim, bias=False) # removed for fused version
+        # self.v_proj = Linear(hidden_size, num_kv_heads * self.head_dim, bias=False) # removed for fused version
         self.o_proj = Linear(num_heads * self.head_dim, hidden_size, bias=False)
 
         # MLP (SwiGLU)
@@ -269,12 +272,13 @@ class DecoderLayer:
 
         # Self-attention with pre-norm
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
+        # hidden_states = self.input_layernorm(hidden_states)
 
         # Project to Q, K, V
-        q = self.q_proj(hidden_states)
-        k = self.k_proj(hidden_states)
-        v = self.v_proj(hidden_states)
+        # q = self.q_proj(hidden_states)
+        # k = self.k_proj(hidden_states)
+        # v = self.v_proj(hidden_states)
+        q, k, v = self.fused_qkv(hidden_states)
 
         # Reshape for attention
         q = q.reshape(batch, seq_len, self.num_heads, self.head_dim).permute(0, 2, 1, 3)

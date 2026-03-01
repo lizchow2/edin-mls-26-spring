@@ -192,23 +192,27 @@ def load_weights_from_hf_model(model, hf_model) -> None:
     for i, layer in enumerate(model.text_decoder.layers):
         prefix = f"language_model.model.layers.{i}"
 
-        load_rmsnorm_weight_from_hf(
-            layer.input_layernorm,
-            hf_state[f"{prefix}.input_layernorm.weight"],
+        # load_rmsnorm_weight_from_hf(
+        #     layer.input_layernorm,
+        #     hf_state[f"{prefix}.input_layernorm.weight"],
+        # )
+        load_fused_qkv_weights(
+            layer.fused_qkv, 
+            prefix, hf_state
         )
 
-        load_linear_weight(
-            layer.q_proj,
-            hf_state[f"{prefix}.self_attn.q_proj.weight"],
-        )
-        load_linear_weight(
-            layer.k_proj,
-            hf_state[f"{prefix}.self_attn.k_proj.weight"],
-        )
-        load_linear_weight(
-            layer.v_proj,
-            hf_state[f"{prefix}.self_attn.v_proj.weight"],
-        )
+        # load_linear_weight(
+        #     layer.q_proj,
+        #     hf_state[f"{prefix}.self_attn.q_proj.weight"],
+        # )
+        # load_linear_weight(
+        #     layer.k_proj,
+        #     hf_state[f"{prefix}.self_attn.k_proj.weight"],
+        # )
+        # load_linear_weight(
+        #     layer.v_proj,
+        #     hf_state[f"{prefix}.self_attn.v_proj.weight"],
+        # )
         load_linear_weight(
             layer.o_proj,
             hf_state[f"{prefix}.self_attn.o_proj.weight"],
@@ -282,3 +286,16 @@ def load_model_from_hf(model_name: str = "zai-org/GLM-ASR-Nano-2512"):
     gc.collect()
 
     return triton_model, processor
+
+def load_fused_qkv_weights(fused_layer, hf_prefix, hf_state):
+    fused_layer.norm_weight.copy_(hf_state[f"{hf_prefix}.input_layernorm.weight"].detach())
+    
+    q_w = hf_state[f"{hf_prefix}.self_attn.q_proj.weight"].detach().t()
+    k_w = hf_state[f"{hf_prefix}.self_attn.k_proj.weight"].detach().t()
+    v_w = hf_state[f"{hf_prefix}.self_attn.v_proj.weight"].detach().t()
+    
+    combined = torch.cat([q_w, k_w, v_w], dim=-1)
+    fused_layer.qkv_weight.copy_(combined)
+    
+    fused_layer.norm_weight = fused_layer.norm_weight.cuda()
+    fused_layer.qkv_weight = fused_layer.qkv_weight.cuda()
