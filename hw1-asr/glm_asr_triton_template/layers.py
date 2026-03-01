@@ -86,9 +86,6 @@ def rmsnorm_kernel(
     tl.store(output_ptr, y, mask=mask)
 # </logic-sync>
 
-import triton
-import triton.language as tl
-
 @triton.jit
 def fused_residual_rmsnorm_kernel(
     X_ptr,         
@@ -621,6 +618,12 @@ class FusedResidualRMSNorm:
     def __call__(self, x: torch.Tensor, residual_to_add: torch.Tensor) -> torch.Tensor:
         M, N = x.view(-1, x.shape[-1]).shape
         norm_out = torch.empty_like(x)
+
+        if self.weight.device != x.device:
+            self.weight = self.weight.to(x.device)
+
+        if residual_to_add is None:
+            residual_to_add = torch.zeros_like(x)
         
         grid = (M,)
         block = triton.next_power_of_2(self.hidden_size)
