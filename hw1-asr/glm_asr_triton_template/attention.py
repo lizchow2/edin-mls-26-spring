@@ -88,6 +88,21 @@ def attention_scores_kernel(
         tl.store(s_ptrs, scores, mask=mask_s)
 
 
+"""
+This is used inside attention to normalise the scores matrix (Q·Kᵀ). 
+It reads and writes back to the same tensor (scores_ptr). 
+
+Pesudocode:
+row = get(row)
+max = max(row)
+sum = 0
+for all num in row: 
+  if -inf then 0 else num -= max, exp(num), sum += num
+for all in row:
+ num /= sum
+write back row
+"""
+
 @triton.jit
 def softmax_inplace_kernel(scores_ptr, stride_s, seq_k, BLOCK_SIZE: tl.constexpr):
     """
@@ -105,8 +120,19 @@ def softmax_inplace_kernel(scores_ptr, stride_s, seq_k, BLOCK_SIZE: tl.constexpr
     # Step 3: Compute exp and normalize
     # Step 4: Store back
 
-    # YOUR CODE HERE
-    pass
+    row_start = scores_ptr + row * stride_s
+    columns = tl.arange(0, BLOCK_SIZE)
+    mask = columns < seq_k # Only load up to seq_k columns
+    values = tl.load(row_start + columns, mask=mask, other=float('-inf'))
+
+    max_value = tl.max(values, axis=0)
+    values = values - max_value
+
+    values = tl.exp(values)
+    sum_values = tl.sum(values, axis=0)
+    values = values / sum_values
+
+    tl.store(scores_ptr + row * stride_s + columns, values, mask=mask)
 
 
 @triton.jit
@@ -144,8 +170,18 @@ def attention_output_kernel(
     # Step 3: Compute weighted sum
     # Step 4: Store output
 
-    # YOUR CODE HERE
-    pass
+    offset_row_k = tl.arange(0, BLOCK_K)
+    offset_col_d = tl.arange(0, BLOCK_D)
+    mask_weights = offset_row_k < seq_k
+    weights = tl.load(attn_ptr + pid_bh * stride_w0 + pid_q * stride_w1 + offset_row_k * stride_w2, mask=mask_weights, other=0.0)
+
+    mask_values = (offset_row_k[:, None] < seq_k) & (offset_col_d[None, :] < head_dim)
+    values = tl.load(v_ptr + pid_bh * stride_v0 + offset_row_k[:, None] * stride_v1 + offset_col_d[None, :] * stride_v2, mask=mask_values, other=0.0)
+
+    weighted_sum = tl.sum(values * weights[:, None], axis=0)
+
+    mask_store = offset_col_d < head_dim
+    tl.store(output_ptr + pid_bh * stride_o0 + pid_q * stride_o1 + offset_col_d * stride_o2, weighted_sum, mask=mask_store)
 
 
 @triton.jit
