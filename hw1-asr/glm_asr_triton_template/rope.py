@@ -58,9 +58,51 @@ def compute_freqs_kernel(
     # Step 3: Compute freqs = position * inv_freq
     # Step 4: Compute cos and sin
     # Step 5: Store concatenated cos/sin
+    pos = positions_ptr + (stride_pos * pid)
+    offs = tl.arange(0, BLOCK)
+    pos = tl.load(pos)
 
-    # YOUR CODE HERE
-    pass
+    inv_fr = inv_freq_ptr + (stride_inv * offs)
+
+    mask_freq = offs < half_dim
+    inv_fr = tl.load(inv_fr, mask=mask_freq)
+
+    theta = pos * inv_fr
+    cos = tl.cos(theta)
+    sin = tl.sin(theta)
+
+    # ==========================================
+    # 1. Establish the CLEAN Base Pointers (Scalars)
+    # This anchors us to the start of the row for this token.
+    # ==========================================
+    cos_row_base = cos_ptr + (stride_cos0 * pid)
+    sin_row_base = sin_ptr + (stride_sin0 * pid)
+
+    # ==========================================
+    # 2. Build the FIRST Half Blocks
+    # Base + offsets
+    # ==========================================
+    cos_ptrs_half1 = cos_row_base + (offs * stride_cos1)
+    sin_ptrs_half1 = sin_row_base + (offs * stride_sin1)
+
+    # ==========================================
+    # 3. Build the SECOND Half Blocks
+    # Base + (half_dim shift) + offsets
+    # ==========================================
+    cos_ptrs_half2 = cos_row_base + (half_dim * stride_cos1) + (offs * stride_cos1)
+    sin_ptrs_half2 = sin_row_base + (half_dim * stride_sin1) + (offs * stride_sin1)
+
+    # ==========================================
+    # 4. Store them all!
+    # ==========================================
+    tl.store(cos_ptrs_half1, cos, mask=mask_freq)
+    tl.store(sin_ptrs_half1, sin, mask=mask_freq)
+    tl.store(cos_ptrs_half2, cos, mask=mask_freq)
+    tl.store(sin_ptrs_half2, sin, mask=mask_freq)
+
+    
+
+    
 
 
 # ============================================================================
