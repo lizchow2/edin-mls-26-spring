@@ -231,6 +231,7 @@ def fuse_attention_kernel(
     scale, # 1/sqrt(head_dim)
     seq_k, # number of key/value tokens
     head_dim, # size of each token vector
+    is_causal,   
     # Strides for Q
     stride_q0, 
     stride_q1, 
@@ -269,8 +270,9 @@ def fuse_attention_kernel(
     attention_score = tl.sum(key_matrix * query_vector[None, :], axis=1) * scale
 
     # 4. Apply casual mask 
-    future_mask = key_positions > pid_query
-    attention_score = tl.where(future_mask, -float("inf"), attention_score)
+    if is_causal:
+        future_mask = key_positions > pid_query
+        attention_score = tl.where(future_mask, -float("inf"), attention_score)
     pad_mask = key_positions >= seq_k
     attention_score = tl.where(pad_mask, -float("inf"), attention_score)
 
@@ -431,6 +433,7 @@ def scaled_dot_product_attention(
             float(scale),              # scale
             seq_k_padded,              # seq_k
             head_dim_padded,           # head_dim
+            1 if is_causal else 0,
             q_flat.stride(0),          # stride_q0
             q_flat.stride(1),          # stride_q1
             q_flat.stride(2),          # stride_q2
