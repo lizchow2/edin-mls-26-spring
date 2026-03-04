@@ -63,6 +63,228 @@ def rmsnorm_kernel(
     y = x_norm * w
     tl.store(y_ptr + pid * stride_y + offs, y, mask=mask)
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_K': 128}, num_warps=8, num_stages=3),
+    ],
+    key=['M', 'K'], 
+)
+@triton.jit
+def final_fused_qkv_kernel(
+    x_ptr, w_norm_ptr, w_qkv_ptr, 
+    q_ptr, k_ptr, v_ptr,
+    stride_xm, stride_xk,
+    stride_qkv_k, stride_qkv_n,
+    M, K, N_Q, N_KV, eps,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """2D Parallel Fused Kernel"""
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    total_n = N_Q + 2 * N_KV
+
+    # 1. Compute RMS Norm
+    var = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    for k in range(0, K, BLOCK_K):
+        rk = k + tl.arange(0, BLOCK_K)
+        x = tl.load(x_ptr + rm[:, None] * stride_xm + rk[None, :] * stride_xk, 
+                    mask=(rm[:, None] < M) & (rk[None, :] < K), other=0.0).to(tl.float32)
+        var += tl.sum(x * x, axis=1)
+    rsqrt_var = tl.rsqrt(var / K + eps)
+
+    # 2. Parallel Matrix Multiplication
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(0, K, BLOCK_K):
+        rk = k + tl.arange(0, BLOCK_K)
+        x = tl.load(x_ptr + rm[:, None] * stride_xm + rk[None, :] * stride_xk,
+                    mask=(rm[:, None] < M) & (rk[None, :] < K), other=0.0).to(tl.float32)
+        w_norm = tl.load(w_norm_ptr + rk, mask=rk < K, other=0.0)
+        
+        x_norm = (x * rsqrt_var[:, None]) * w_norm[None, :]
+        
+        w_val = tl.load(w_qkv_ptr + rk[:, None] * stride_qkv_k + rn[None, :] * stride_qkv_n,
+                        mask=(rk[:, None] < K) & (rn[None, :] < total_n), other=0.0)
+        acc += tl.dot(x_norm.to(tl.float16), w_val.to(tl.float16))
+
+    n_start = pid_n * BLOCK_N
+    mask = (rm[:, None] < M) & (rn[None, :] < total_n)
+    if n_start < N_Q:
+        tl.store(q_ptr + rm[:, None] * N_Q + (rn[None, :] - 0), acc, mask=mask)
+    elif n_start < N_Q + N_KV:
+        tl.store(k_ptr + rm[:, None] * N_KV + (rn[None, :] - N_Q), acc, mask=mask)
+    else:
+        tl.store(v_ptr + rm[:, None] * N_KV + (rn[None, :] - (N_Q + N_KV)), acc, mask=mask)
+
+class FusedRMSNormQKV:
+    def __init__(self, hidden_size, num_heads, num_kv_heads, head_dim, eps=1e-6):
+        self.hidden_size = hidden_size
+        self.eps = eps
+        self.q_out = num_heads * head_dim
+        self.kv_out = num_kv_heads * head_dim
+        self.total_out = self.q_out + 2 * self.kv_out
+        self.norm_weight = torch.ones(hidden_size, dtype=torch.float32)
+        self.qkv_weight = torch.zeros((hidden_size, self.total_out), dtype=torch.float32)
+
+    def __call__(self, x: torch.Tensor):
+        M = int(np.prod(x.shape[:-1]))
+        K = self.hidden_size
+        
+        q = torch.empty((M, self.q_out), device=x.device, dtype=x.dtype)
+        k = torch.empty((M, self.kv_out), device=x.device, dtype=x.dtype)
+        v = torch.empty((M, self.kv_out), device=x.device, dtype=x.dtype)
+        
+        grid = lambda META: (
+            triton.cdiv(M, META['BLOCK_M']),
+            triton.cdiv(self.total_out, META['BLOCK_N'])
+        )
+        
+        final_fused_qkv_kernel[grid](
+            x_ptr=x, w_norm_ptr=self.norm_weight, w_qkv_ptr=self.qkv_weight,
+            q_ptr=q, k_ptr=k, v_ptr=v,
+            stride_xm=K, stride_xk=1, stride_qkv_k=self.total_out, stride_qkv_n=1,
+            M=M, K=K, N_Q=self.q_out, N_KV=self.kv_out, eps=self.eps
+        )
+        return q.reshape(*x.shape[:-1], -1), k.reshape(*x.shape[:-1], -1), v.reshape(*x.shape[:-1], -1)
+
+@triton.autotune(
+    configs=[
+        # All configs must use BLOCK_N=128 to satisfy the RoPE half-dimension split
+        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_K': 128}, num_warps=8, num_stages=3),
+    ],
+    key=['M', 'K'], 
+)
+@triton.jit
+def fused_qkv_rope_kernel(
+    x_ptr, w_norm_ptr, w_qkv_ptr, 
+    q_ptr, k_ptr, v_ptr,
+    cos_ptr, sin_ptr, pos_ptr,
+    stride_xm, stride_xk,
+    stride_qkv_k, stride_qkv_n,
+    stride_cos_pos, stride_cos_d,
+    M, K, N_Q, N_KV, eps,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """
+    Silver Step: Fused RMSNorm + QKV MatMul + RoPE.
+    Grid: (batch_seq / BLOCK_M, total_heads)
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    total_n = N_Q + 2 * N_KV
+
+    # 1. Compute RMS Norm (unchanged)
+    var = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    for k in range(0, K, BLOCK_K):
+        rk = k + tl.arange(0, BLOCK_K)
+        x = tl.load(x_ptr + rm[:, None] * stride_xm + rk[None, :] * stride_xk, 
+                    mask=(rm[:, None] < M) & (rk[None, :] < K), other=0.0).to(tl.float32)
+        var += tl.sum(x * x, axis=1)
+    rsqrt_var = tl.rsqrt(var / K + eps)
+
+    # 2. Matrix Multiplication
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(0, K, BLOCK_K):
+        rk = k + tl.arange(0, BLOCK_K)
+        x = tl.load(x_ptr + rm[:, None] * stride_xm + rk[None, :] * stride_xk,
+                    mask=(rm[:, None] < M) & (rk[None, :] < K), other=0.0).to(tl.float32)
+        w_norm = tl.load(w_norm_ptr + rk, mask=rk < K, other=0.0)
+        x_norm = (x * rsqrt_var[:, None]) * w_norm[None, :]
+        
+        w_val = tl.load(w_qkv_ptr + rk[:, None] * stride_qkv_k + rn[None, :] * stride_qkv_n,
+                        mask=(rk[:, None] < K) & (rn[None, :] < total_n), other=0.0)
+        acc += tl.dot(x_norm.to(tl.float16), w_val.to(tl.float16))
+
+    if pid_n < (N_Q + N_KV) // BLOCK_N:
+        HALF_BLOCK_N: tl.constexpr = BLOCK_N // 2
+        # Load position IDs for the current rows
+        pos = tl.load(pos_ptr + rm, mask=rm < M, other=0)
+        
+        # Load only the first half of cos/sin (halves are identical in cache)
+        offs_half = tl.arange(0, HALF_BLOCK_N)
+        c = tl.load(cos_ptr + pos[:, None] * stride_cos_pos + offs_half[None, :] * stride_cos_d, 
+                    mask=(rm[:, None] < M), other=0.0)
+        s = tl.load(sin_ptr + pos[:, None] * stride_cos_pos + offs_half[None, :] * stride_cos_d, 
+                    mask=(rm[:, None] < M), other=0.0)
+        
+        # FOLD: Reshape acc from (BLOCK_M, BLOCK_N) to (BLOCK_M, 2, half_dim) 
+        # to split it without using unsupported slices [:]
+        acc_split = tl.reshape(acc, (BLOCK_M, 2, HALF_BLOCK_N))
+        x1 = acc_split[:, 0, :]
+        x2 = acc_split[:, 1, :]
+        
+        # Apply RoPE rotation math
+        y1 = x1 * c - x2 * s
+        y2 = x2 * c + x1 * s
+        
+        # UNFOLD: Concatenate halves back into (BLOCK_M, BLOCK_N)
+        acc = tl.cat([y1, y2], axis=1)
+
+    # 4. Store to Global Memory (unchanged)
+    n_start = pid_n * BLOCK_N
+    mask = (rm[:, None] < M) & (rn[None, :] < total_n)
+    if n_start < N_Q:
+        tl.store(q_ptr + rm[:, None] * N_Q + (rn[None, :] - 0), acc, mask=mask)
+    elif n_start < N_Q + N_KV:
+        tl.store(k_ptr + rm[:, None] * N_KV + (rn[None, :] - N_Q), acc, mask=mask)
+    else:
+        tl.store(v_ptr + rm[:, None] * N_KV + (rn[None, :] - (N_Q + N_KV)), acc, mask=mask)
+
+class FusedRMSNormQKVRope:
+    def __init__(self, hidden_size, num_heads, num_kv_heads, head_dim, rope, eps=1e-6):
+        self.hidden_size = hidden_size
+        self.eps = eps
+        self.head_dim = head_dim
+        self.q_out = num_heads * head_dim
+        self.kv_out = num_kv_heads * head_dim
+        self.total_out = self.q_out + 2 * self.kv_out
+        self.rope_emb = rope
+        
+        # Weight buffers should be initialized/loaded via weight_loader.py
+        self.norm_weight = torch.ones(hidden_size, dtype=torch.float32)
+        self.qkv_weight = torch.zeros((hidden_size, self.total_out), dtype=torch.float32)
+
+    def __call__(self, x: torch.Tensor, position_ids: torch.Tensor):
+        M = int(np.prod(x.shape[:-1]))
+        K = self.hidden_size
+        
+        q = torch.empty((M, self.q_out), device=x.device, dtype=x.dtype)
+        k = torch.empty((M, self.kv_out), device=x.device, dtype=x.dtype)
+        v = torch.empty((M, self.kv_out), device=x.device, dtype=x.dtype)
+        
+        # Ensure RoPE cache is ready for the current device
+        self.rope_emb._update_cache(self.rope_emb.max_seq_len_cached, device=x.device)
+        
+        grid = lambda META: (
+            triton.cdiv(M, META['BLOCK_M']),
+            triton.cdiv(self.total_out, META['BLOCK_N'])
+        )
+        
+        fused_qkv_rope_kernel[grid](
+            x_ptr=x, w_norm_ptr=self.norm_weight, w_qkv_ptr=self.qkv_weight,
+            q_ptr=q, k_ptr=k, v_ptr=v,
+            cos_ptr=self.rope_emb.cos_cached, sin_ptr=self.rope_emb.sin_cached, 
+            pos_ptr=position_ids,
+            stride_xm=K, stride_xk=1, stride_qkv_k=self.total_out, stride_qkv_n=1,
+            stride_cos_pos=self.rope_emb.cos_cached.stride(0), 
+            stride_cos_d=self.rope_emb.cos_cached.stride(1),
+            M=M, K=K, N_Q=self.q_out, N_KV=self.kv_out, eps=self.eps
+        )
+        
+        return (q.reshape(*x.shape[:-1], -1), 
+                k.reshape(*x.shape[:-1], -1), 
+                v.reshape(*x.shape[:-1], -1))
+
 
 @triton.jit
 def layernorm_kernel(
