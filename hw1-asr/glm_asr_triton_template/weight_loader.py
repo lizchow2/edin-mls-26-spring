@@ -293,7 +293,14 @@ def load_model_from_hf(model_name: str = "zai-org/GLM-ASR-Nano-2512"):
 
 
 
-    processor = AutoProcessor.from_pretrained(model_name)
+    # Try local cache first, fall back to downloading
+    try:
+        processor = AutoProcessor.from_pretrained(model_name, local_files_only=True)
+    except Exception:
+        try:
+            processor = AutoProcessor.from_pretrained(model_name)
+        except Exception:
+            processor = AutoProcessor.from_pretrained(model_name, use_fast=False)
 
 
     load_weights_from_hf_model(triton_model, hf_model)
