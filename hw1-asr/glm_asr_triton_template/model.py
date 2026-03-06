@@ -14,7 +14,7 @@ from layers import (
     gelu, silu, softmax, get_stream
 )
 from rope import RotaryEmbedding, apply_rotary_pos_emb
-from attention import scaled_dot_product_attention, MultiHeadAttention
+from flash import scaled_dot_product_attention, MultiHeadAttention
 from conv import Conv1d, Conv1dSubsampler
 
 
