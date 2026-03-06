@@ -257,7 +257,7 @@ def load_model_from_hf(model_name: str = "zai-org/GLM-ASR-Nano-2512"):
 
     print(f"Loading HuggingFace model: {model_name}")
 
-    hf_config = AutoConfig.from_pretrained(model_name)
+    hf_config = AutoConfig.from_pretrained(model_name, local_files_only=True)
     triton_config = create_config_from_hf(hf_config)
 
     print("Creating Triton model with config:")
@@ -297,7 +297,7 @@ def load_model_from_hf(model_name: str = "zai-org/GLM-ASR-Nano-2512"):
         def __contains__(self, key):
             return key in _tensor_index
 
-    processor = AutoProcessor.from_pretrained(model_name)
+    processor = AutoProcessor.from_pretrained(model_name, local_files_only=True)
 
     load_weights_from_hf_model(triton_model, LazyStateDict())
 
