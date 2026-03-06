@@ -194,7 +194,7 @@ def compute_flash_attention_kernel(
         k_tile  = tl.load(k_ptrs, mask=mask_kn & mask_kd, other=0.0)
 
         # Attention scores: (BLOCK_M, BLOCK_N) = q_tile @ k_tile^T
-        scores = tl.dot(q_tile, tl.trans(k_tile)) * scale
+        scores = tl.dot(q_tile, tl.trans(k_tile), allow_tf32=False) * scale
 
         # Add additive attention mask tile (e.g. padding mask)
         if HAS_MASK:
@@ -232,7 +232,7 @@ def compute_flash_attention_kernel(
         v_tile  = tl.load(v_ptrs, mask=mask_vn & mask_vd, other=0.0)
 
         # Accumulate weighted values
-        acc = acc + tl.dot(p, v_tile)                    # (BLOCK_M, BLOCK_D)
+        acc = acc + tl.dot(p, v_tile, allow_tf32=False)   # (BLOCK_M, BLOCK_D)
         l   = l   + tl.sum(p, axis=1)                   # (BLOCK_M,)
 
         m = m_new
