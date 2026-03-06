@@ -89,11 +89,13 @@ def load_embedding_weight_from_hf(triton_emb, hf_weight):
     triton_emb.weight = hf_weight.detach().to(torch.float32).clone()
 
 
-def load_weights_from_hf_model(model, hf_state) -> None:
+def load_weights_from_hf_model(model, hf_model) -> None:
     """
-    Load weights from a dict-like hf_state into Triton model.
-    hf_state can be a real state_dict or a LazyStateDict from safetensors.
+    Load weights from HuggingFace GLM-ASR model into Triton model.
+
     """
+    hf_state = hf_model.state_dict()
+
     print("Loading audio encoder weights...")
 
     load_conv1d_weight_from_hf(
@@ -247,17 +249,17 @@ def load_weights_from_hf_model(model, hf_state) -> None:
 def load_model_from_hf(model_name: str = "zai-org/GLM-ASR-Nano-2512"):
     """
     Load GLM-ASR model from HuggingFace and create Triton version.
-    Uses lazy safetensors loading to avoid holding two copies in RAM.
+
     """
-    import os
-    from transformers import AutoProcessor, AutoConfig
-    from huggingface_hub import snapshot_download
-    from safetensors import safe_open
+    from transformers import AutoProcessor, GlmAsrForConditionalGeneration, AutoConfig
+
+
+
     from model import GlmAsrModel
 
     print(f"Loading HuggingFace model: {model_name}")
 
-    hf_config = AutoConfig.from_pretrained(model_name, local_files_only=True)
+    hf_config = AutoConfig.from_pretrained(model_name)
     triton_config = create_config_from_hf(hf_config)
 
     print("Creating Triton model with config:")
@@ -270,35 +272,36 @@ def load_model_from_hf(model_name: str = "zai-org/GLM-ASR-Nano-2512"):
 
     triton_model = GlmAsrModel(triton_config)
 
-    # Download (or reuse cached) model files — no full model object in RAM
-    print("Loading HuggingFace weights (memory-efficient via safetensors)...")
-    # Use cached files only — avoids re-downloading if the model is already cached
-    model_path = snapshot_download(model_name, local_files_only=True)
+    print("Loading HuggingFace weights...")
+    hf_model = GlmAsrForConditionalGeneration.from_pretrained(
+        model_name, torch_dtype=torch.float32, device_map="cpu"
+    )
 
-    # Build index: tensor name -> safetensors file
-    _tensor_index = {}
-    for fname in sorted(os.listdir(model_path)):
-        if fname.endswith(".safetensors"):
-            fpath = os.path.join(model_path, fname)
-            with safe_open(fpath, framework="pt", device="cpu") as f:
-                for key in f.keys():
-                    _tensor_index[key] = fpath
 
-    class LazyStateDict:
-        """Reads one tensor at a time from safetensors; never holds the full model."""
-        def __getitem__(self, key):
-            fpath = _tensor_index[key]
-            with safe_open(fpath, framework="pt", device="cpu") as f:
-                return f.get_tensor(key)
 
-        def get(self, key, default=None):
-            return self[key] if key in _tensor_index else default
 
-        def __contains__(self, key):
-            return key in _tensor_index
 
-    processor = AutoProcessor.from_pretrained(model_name, local_files_only=True)
 
-    load_weights_from_hf_model(triton_model, LazyStateDict())
+
+
+
+
+
+
+
+
+
+
+
+    processor = AutoProcessor.from_pretrained(model_name)
+
+
+    load_weights_from_hf_model(triton_model, hf_model)
+
+
+    del hf_model
+    import gc
+
+    gc.collect()
 
     return triton_model, processor

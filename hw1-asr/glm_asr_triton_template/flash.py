@@ -162,16 +162,16 @@ def compute_flash_attention_kernel(
     offs_m = pid_qblock * BLOCK_M + tl.arange(0, BLOCK_M)   # (BLOCK_M,)
     offs_d = tl.arange(0, BLOCK_D)                           # (BLOCK_D,)
 
-    
+
     # Load Q tile: shape (BLOCK_M, BLOCK_D)                              
-  
+
     q_base  = q_ptr + pid_bh * stride_q_bh
     q_ptrs  = q_base + offs_m[:, None] * stride_q_seq + offs_d[None, :] * stride_q_dim
     mask_qm = offs_m[:, None] < seq_q
     mask_qd = offs_d[None, :] < head_dim
     q_tile  = tl.load(q_ptrs, mask=mask_qm & mask_qd, other=0.0)
 
-   
+
     # Online-softmax accumulators                                         
 
     acc = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)  # weighted value sum
@@ -194,7 +194,7 @@ def compute_flash_attention_kernel(
         k_tile  = tl.load(k_ptrs, mask=mask_kn & mask_kd, other=0.0)
 
         # Attention scores: (BLOCK_M, BLOCK_N) = q_tile @ k_tile^T
-        scores = tl.dot(q_tile, tl.trans(k_tile), allow_tf32=False) * scale
+        scores = tl.dot(q_tile, tl.trans(k_tile)) * scale
 
         # Add additive attention mask tile (e.g. padding mask)
         if HAS_MASK:
@@ -213,7 +213,7 @@ def compute_flash_attention_kernel(
         if IS_CAUSAL:
             scores = tl.where(offs_m[:, None] >= offs_n[None, :], scores, float('-inf'))
 
-        
+
         # New running row-max
         m_new = tl.maximum(m, tl.max(scores, axis=1))   # (BLOCK_M,)
 
@@ -232,14 +232,14 @@ def compute_flash_attention_kernel(
         v_tile  = tl.load(v_ptrs, mask=mask_vn & mask_vd, other=0.0)
 
         # Accumulate weighted values
-        acc = acc + tl.dot(p, v_tile, allow_tf32=False)   # (BLOCK_M, BLOCK_D)
+        acc = acc + tl.dot(p, v_tile)                    # (BLOCK_M, BLOCK_D)
         l   = l   + tl.sum(p, axis=1)                   # (BLOCK_M,)
 
         m = m_new
 
 
     # Normalise and store output                                          #
- 
+
     acc = acc / l[:, None]
 
     o_base  = o_ptr + pid_bh * stride_o_bh
@@ -281,7 +281,7 @@ def flash_attention_fwd_triton(
     v_flat = v.reshape(BH, K, D).to(torch.float32).contiguous()
 
     # Prepare mask: expand to (B, H, Q, K) then flatten to (BH, Q, K)
-    
+
     if attention_mask is not None:
         assert attention_mask.shape[-2:] == (Q, K) 
         if attention_mask.ndim == 4:
