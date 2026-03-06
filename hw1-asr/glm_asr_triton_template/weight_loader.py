@@ -272,7 +272,8 @@ def load_model_from_hf(model_name: str = "zai-org/GLM-ASR-Nano-2512"):
 
     # Download (or reuse cached) model files — no full model object in RAM
     print("Loading HuggingFace weights (memory-efficient via safetensors)...")
-    model_path = snapshot_download(model_name)
+    # Use cached files only — avoids re-downloading if the model is already cached
+    model_path = snapshot_download(model_name, local_files_only=True)
 
     # Build index: tensor name -> safetensors file
     _tensor_index = {}
