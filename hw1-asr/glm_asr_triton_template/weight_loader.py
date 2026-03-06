@@ -267,17 +267,28 @@ def load_model_from_hf(model_name: str = "zai-org/GLM-ASR-Nano-2512"):
 
     triton_model = GlmAsrModel(triton_config)
 
-    print("Loading HuggingFace weights...")
-    hf_model = GlmAsrForConditionalGeneration.from_pretrained(
-        model_name, torch_dtype=torch.float32, device_map="cpu"
-    )
+    # Download (or reuse cached) model files — no full model object in RAM
+    print("Loading HuggingFace weights (memory-efficient via safetensors)...")
+    model_path = snapshot_download(model_name)
 
-    processor = AutoProcessor.from_pretrained(model_name)
+    # Build index: tensor name -> safetensors file
+    _tensor_index = {}
+    for fname in sorted(os.listdir(model_path)):
+        if fname.endswith(".safetensors"):
+            fpath = os.path.join(model_path, fname)
+            with safe_open(fpath, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    _tensor_index[key] = fpath
 
-    load_weights_from_hf_model(triton_model, hf_model)
+    class LazyStateDict:
+        """Reads one tensor at a time from safetensors; never holds the full model."""
+        def __getitem__(self, key):
+            fpath = _tensor_index[key]
+            with safe_open(fpath, framework="pt", device="cpu") as f:
+                return f.get_tensor(key)
 
-    del hf_model
-    import gc
+        def get(self, key, default=None):
+            return self[key] if key in _tensor_index else default
 
         def __contains__(self, key):
             return key in _tensor_index
