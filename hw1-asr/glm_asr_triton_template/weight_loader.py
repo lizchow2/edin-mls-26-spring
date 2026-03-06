@@ -279,6 +279,11 @@ def load_model_from_hf(model_name: str = "zai-org/GLM-ASR-Nano-2512"):
     del hf_model
     import gc
 
-    gc.collect()
+        def __contains__(self, key):
+            return key in _tensor_index
+
+    processor = AutoProcessor.from_pretrained(model_name)
+
+    load_weights_from_hf_model(triton_model, LazyStateDict())
 
     return triton_model, processor
