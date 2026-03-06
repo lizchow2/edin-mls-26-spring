@@ -108,10 +108,10 @@ def online_softmax(x_ptr, y_ptr, stride_x, stride_y, n_cols, BLOCK_SIZE: tl.cons
 
 
 @triton.autotune(configs=[
-    triton.Config(kwargs={'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_D': 64, 'HAS_MASK': False}, num_warps=4),
-    triton.Config(kwargs={'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_D': 64, 'HAS_MASK': False}, num_warps=4),
-    triton.Config(kwargs={'BLOCK_M': 512, 'BLOCK_N': 64, 'BLOCK_D': 64, 'HAS_MASK': False}, num_warps=4),
-    triton.Config(kwargs={'BLOCK_M': 1024, 'BLOCK_N': 64, 'BLOCK_D': 64, 'HAS_MASK': False}, num_warps=8),
+    triton.Config(kwargs={'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_D': 64}, num_warps=4),
+    triton.Config(kwargs={'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_D': 64}, num_warps=4),
+    triton.Config(kwargs={'BLOCK_M': 512, 'BLOCK_N': 64, 'BLOCK_D': 64}, num_warps=4),
+    triton.Config(kwargs={'BLOCK_M': 1024, 'BLOCK_N': 64, 'BLOCK_D': 64}, num_warps=8),
   ],
   key=['seq_q', 'seq_k']
                  
