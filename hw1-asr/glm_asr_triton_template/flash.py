@@ -82,8 +82,6 @@ Online softmax fixes this with one key identity:
             all the keys!
             """
 
-TRITON_PRINT_AUTOTUNING = 1
-
 @triton.jit
 def online_softmax(x_ptr, y_ptr, stride_x, stride_y, n_cols, BLOCK_SIZE: tl.constexpr):
     """
@@ -107,15 +105,6 @@ def online_softmax(x_ptr, y_ptr, stride_x, stride_y, n_cols, BLOCK_SIZE: tl.cons
     tl.store(write_row + columns, values, mask=mask)
 
 
-@triton.autotune(configs=[
-    triton.Config(kwargs={'BLOCK_M': 128, 'BLOCK_N': 64, 'BLOCK_D': 64}, num_warps=4),
-    triton.Config(kwargs={'BLOCK_M': 256, 'BLOCK_N': 64, 'BLOCK_D': 64}, num_warps=4),
-    triton.Config(kwargs={'BLOCK_M': 512, 'BLOCK_N': 64, 'BLOCK_D': 64}, num_warps=4),
-    triton.Config(kwargs={'BLOCK_M': 1024, 'BLOCK_N': 64, 'BLOCK_D': 64}, num_warps=8),
-  ],
-  key=['seq_q', 'seq_k']
-                 
-)
 @triton.jit
 def compute_flash_attention_kernel(
     q_ptr,                  # (BH, seq_q, head_dim)
@@ -293,8 +282,16 @@ def flash_attention_fwd_triton(
 
     out = torch.empty((BH, Q, D), device=q.device, dtype=torch.float32)
 
-    # Grid uses a lambda so the autotuner's chosen BLOCK_M is picked up at launch time
-    grid = lambda meta: (triton.cdiv(Q, meta['BLOCK_M']), BH)
+    # Compute block sizes that fit within 64 KB shared memory.
+    # tl.dot allocates ~(BLOCK_M + BLOCK_N) * BLOCK_D * 4 bytes.
+    # BLOCK_D must be >= head_dim (power of two) for correct loads.
+    BLOCK_D = next_power_of_two(D)
+    shm_budget = 49152  # 48 KB — conservative limit with headroom
+    max_tiles = max(32, shm_budget // (BLOCK_D * 4))
+    BLOCK_N = max(16, min(64, max_tiles // 3))
+    BLOCK_M = max(16, min(128, max_tiles - BLOCK_N))
+
+    grid = (triton.cdiv(Q, BLOCK_M), BH)
 
     compute_flash_attention_kernel[grid](
         q_flat, k_flat, v_flat, out,
@@ -310,6 +307,9 @@ def flash_attention_fwd_triton(
         mask_flat.stride(2) if mask_flat is not None else 0,
         HAS_MASK=mask_flat is not None,
         IS_CAUSAL=is_causal,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_D=BLOCK_D,
     )
 
     return out.reshape(B, H, Q, D).to(dtype=q.dtype)
