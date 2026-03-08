@@ -205,7 +205,7 @@ class Conv1d:
                 col = col.to(x.device)
 
             if self.weight_padded.device != x.device:
-                self.weight_padded = self.weight_padded.to(x.device)
+                self.weight_padded = self.weight_padded.to(device=x.device, dtype=torch.float32)
 
             output_padded = torch.empty(
                 (batch, self.out_channels_padded, out_length_padded),
@@ -237,12 +237,12 @@ class Conv1d:
             output = output_padded[:, : self.out_channels, : out_length].contiguous()
         else:
             if self.weight.device != x.device:
-                self.weight = self.weight.to(x.device)
-            output = torch.einsum("oc,bcl->bol", self.weight, col)
+                self.weight = self.weight.to(device=x.device, dtype=torch.float32)
+            output = torch.einsum("oc,bcl->bol", self.weight.to(torch.float32), col)
 
         if self.has_bias and self.bias is not None:
             if self.bias.device != output.device:
-                self.bias = self.bias.to(output.device)
+                self.bias = self.bias.to(device=output.device, dtype=torch.float32)
             output = output + self.bias[None, :, None]
 
         return output

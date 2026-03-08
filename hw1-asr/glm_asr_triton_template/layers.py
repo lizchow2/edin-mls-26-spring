@@ -577,7 +577,7 @@ class RMSNorm:
             block = next_power_of_two(self.hidden_size)
             rmsnorm_kernel[(batch_size,)](
                 x_flat,
-                self.weight,
+                self.weight.to(torch.float32),
                 output,
                 x_flat.stride(0),
                 output.stride(0),
@@ -592,7 +592,7 @@ class RMSNorm:
         x_normed = x_float * torch.rsqrt(variance + self.eps)
         if self.weight.device != x.device:
             self.weight = self.weight.to(x.device)
-        return (self.weight * x_normed).to(x.dtype)
+        return (self.weight.to(torch.float32) * x_normed).to(x.dtype)
 
 
 class LayerNorm:
@@ -622,8 +622,8 @@ class LayerNorm:
             block = next_power_of_two(self.hidden_size)
             layernorm_kernel[(batch_size,)](
                 x_flat,
-                self.weight,
-                self.bias,
+                self.weight.to(torch.float32),
+                self.bias.to(torch.float32),
                 output,
                 x_flat.stride(0),
                 output.stride(0),
@@ -641,7 +641,7 @@ class LayerNorm:
             self.weight = self.weight.to(x.device)
         if self.bias.device != x.device:
             self.bias = self.bias.to(x.device)
-        return (self.weight * x_normed + self.bias).to(x.dtype)
+        return (self.weight.to(torch.float32) * x_normed + self.bias.to(torch.float32)).to(x.dtype)
 
 
 def gelu(x: torch.Tensor) -> torch.Tensor:
@@ -747,12 +747,12 @@ class Linear:
 
         if self.weight.device != x.device:
             self.weight = self.weight.to(x.device)
-        output = x_2d @ self.weight.t()
+        output = x_2d @ self.weight.to(torch.float32).t()
 
         if self.has_bias and self.bias_param is not None:
             if self.bias_param.device != x.device:
                 self.bias_param = self.bias_param.to(x.device)
-            output = output + self.bias_param
+            output = output + self.bias_param.to(torch.float32)
 
         return output.reshape(*batch_dims, self.out_features)
 
@@ -835,9 +835,10 @@ class Embedding:
         if self.weight.device != input_ids.device:
             self.weight = self.weight.to(input_ids.device)
 
-        if not input_ids.is_cuda:
+        if not input_ids.is_cuda or self.weight.dtype != torch.float32:
+            # For non-CUDA or non-float32 weights: index then cast (avoids full-table float32 copy)
             flat = input_ids.reshape(-1).to(torch.int64)
-            output = self.weight.index_select(0, flat)
+            output = self.weight[flat].to(torch.float32)
             return output.reshape(*original_shape, self.embedding_dim)
 
         indices_flat = input_ids.reshape(-1).to(torch.int32).contiguous()
@@ -896,7 +897,7 @@ def softmax(x: torch.Tensor, axis: int = -1) -> torch.Tensor:
 class MLP:
     """MLP with SwiGLU gating using Triton."""
 
-    FUSED = True
+    FUSED = False
     TILE_M, TILE_N, TILE_K = 64, 64, 32
 
     def __init__(
