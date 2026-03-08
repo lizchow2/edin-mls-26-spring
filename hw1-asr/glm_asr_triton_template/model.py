@@ -815,21 +815,10 @@ class GlmAsrModel:
             eos_token_ids, dtype=torch.int64, device=generated.device
         )
 
-        # Prefill: allocate KV buffers and process the full input sequence
-        prefill_len = inputs_embeds.shape[1]
-        max_total_len = prefill_len + max_new_tokens
-        kv_buffers = self.text_decoder.allocate_kv_buffers(
-            batch_size=batch_size,
-            max_seq_len=max_total_len,
-            dtype=torch.float32,
-        )
-        hidden_states, cache_pos = self.text_decoder.forward_with_kv_buffers(
-            inputs_embeds, kv_buffers, cache_pos=0
-        )
-        logits = self.lm_head(hidden_states)
-
-        # Autoregressive generation with KV cache
+        # Autoregressive generation
         for _ in range(max_new_tokens):
+            # Get logits for next token
+            logits = self.decode(inputs_embeds=inputs_embeds)
             next_token_logits = logits[:, -1, :] / temperature
 
             # Top-k sampling
@@ -870,11 +859,8 @@ class GlmAsrModel:
             if torch.all(finished):
                 break
 
-            # Decode single new token using KV cache
+            # Update inputs_embeds with new token
             new_embeds = self.text_decoder.embed_tokens(next_token)
-            hidden_states, cache_pos = self.text_decoder.forward_with_kv_buffers(
-                new_embeds, kv_buffers, cache_pos=cache_pos
-            )
-            logits = self.lm_head(hidden_states)
+            inputs_embeds = torch.cat([inputs_embeds, new_embeds], dim=1)
 
         return generated
