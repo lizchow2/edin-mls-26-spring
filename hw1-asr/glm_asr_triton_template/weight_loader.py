@@ -46,14 +46,14 @@ def create_config_from_hf(hf_config):
 
 def load_linear_weight(triton_linear, hf_weight, hf_bias=None):
     """Load weight (and optional bias) into Triton Linear layer."""
-    triton_linear.weight = hf_weight.detach().to(torch.bfloat16).clone()
+    triton_linear.weight = hf_weight.detach().to(torch.float32).clone()
     if hf_bias is not None and triton_linear.has_bias:
-        triton_linear.bias_param = hf_bias.detach().to(torch.bfloat16).clone()
+        triton_linear.bias_param = hf_bias.detach().to(torch.float32).clone()
 
 
 def load_conv1d_weight_from_hf(triton_conv, hf_weight, hf_bias=None):
     """Load weight into Triton Conv1d layer from HF format."""
-    weight = hf_weight.detach().to(torch.bfloat16)
+    weight = hf_weight.detach().to(torch.float32)
     out_channels, in_channels, kernel_size = weight.shape
     triton_conv.weight = weight.reshape(out_channels, in_channels * kernel_size).clone()
 
@@ -63,30 +63,30 @@ def load_conv1d_weight_from_hf(triton_conv, hf_weight, hf_bias=None):
     ):
         triton_conv.weight_padded = torch.zeros(
             (triton_conv.out_channels_padded, triton_conv.col_size_padded),
-            dtype=torch.bfloat16,
+            dtype=torch.float32,
         )
         triton_conv.weight_padded[:out_channels, : triton_conv.col_size] = triton_conv.weight
     else:
         triton_conv.weight_padded = triton_conv.weight
 
     if hf_bias is not None and triton_conv.has_bias:
-        triton_conv.bias = hf_bias.detach().to(torch.bfloat16).clone()
+        triton_conv.bias = hf_bias.detach().to(torch.float32).clone()
 
 
 def load_layernorm_weight_from_hf(triton_ln, hf_weight, hf_bias):
     """Load LayerNorm weights."""
-    triton_ln.weight = hf_weight.detach().to(torch.bfloat16).clone()
-    triton_ln.bias = hf_bias.detach().to(torch.bfloat16).clone()
+    triton_ln.weight = hf_weight.detach().to(torch.float32).clone()
+    triton_ln.bias = hf_bias.detach().to(torch.float32).clone()
 
 
 def load_rmsnorm_weight_from_hf(triton_rms, hf_weight):
     """Load RMSNorm weight."""
-    triton_rms.weight = hf_weight.detach().to(torch.bfloat16).clone()
+    triton_rms.weight = hf_weight.detach().to(torch.float32).clone()
 
 
 def load_embedding_weight_from_hf(triton_emb, hf_weight):
     """Load Embedding weight."""
-    triton_emb.weight = hf_weight.detach().to(torch.bfloat16).clone()
+    triton_emb.weight = hf_weight.detach().to(torch.float32).clone()
 
 
 def load_weights_from_hf_model(model, hf_model) -> None:
@@ -293,7 +293,14 @@ def load_model_from_hf(model_name: str = "zai-org/GLM-ASR-Nano-2512"):
 
 
 
-    processor = AutoProcessor.from_pretrained(model_name)
+    # Try local cache first, fall back to downloading
+    try:
+        processor = AutoProcessor.from_pretrained(model_name, local_files_only=True)
+    except Exception:
+        try:
+            processor = AutoProcessor.from_pretrained(model_name)
+        except Exception:
+            processor = AutoProcessor.from_pretrained(model_name, use_fast=False)
 
 
     load_weights_from_hf_model(triton_model, hf_model)
