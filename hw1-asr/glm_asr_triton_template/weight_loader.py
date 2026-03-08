@@ -46,7 +46,7 @@ def create_config_from_hf(hf_config):
 
 def load_linear_weight(triton_linear, hf_weight, hf_bias=None):
     """Load weight (and optional bias) into Triton Linear layer."""
-    triton_linear.weight = hf_weight.detach().to(torch.float32).clone()
+    triton_linear.weight = hf_weight.detach().to(torch.float16).clone()
     if hf_bias is not None and triton_linear.has_bias:
         triton_linear.bias_param = hf_bias.detach().to(torch.float32).clone()
 
@@ -86,7 +86,7 @@ def load_rmsnorm_weight_from_hf(triton_rms, hf_weight):
 
 def load_embedding_weight_from_hf(triton_emb, hf_weight):
     """Load Embedding weight."""
-    triton_emb.weight = hf_weight.detach().to(torch.float32).clone()
+    triton_emb.weight = hf_weight.detach().to(torch.float16).clone()
 
 
 def load_weights_from_hf_model(model, hf_model) -> None:
@@ -274,7 +274,7 @@ def load_model_from_hf(model_name: str = "zai-org/GLM-ASR-Nano-2512"):
 
     print("Loading HuggingFace weights...")
     hf_model = GlmAsrForConditionalGeneration.from_pretrained(
-        model_name, torch_dtype=torch.float32, device_map="cpu"
+        model_name, torch_dtype=torch.float16, device_map="cpu"
     )
 
 

@@ -726,7 +726,7 @@ class Linear:
             self._K_padded = pad_to_multiple(K, self.TILE_K)
             self._N_padded = pad_to_multiple(N, self.TILE_N)
 
-            weight_t = self.weight.t().contiguous()
+            weight_t = self.weight.to(torch.float32).t().contiguous()
             if self._K_padded > K or self._N_padded > N:
                 weight_pad = torch.zeros(
                     (self._K_padded, self._N_padded),
@@ -758,7 +758,7 @@ class Linear:
 
         if self.weight.device != x.device:
             self.weight = self.weight.to(x.device)
-        output = x_2d @ self.weight.t()
+        output = x_2d @ self.weight.to(torch.float32).t()
 
         if self.has_bias and self.bias_param is not None:
             if self.bias_param.device != x.device:
@@ -848,12 +848,12 @@ class Embedding:
 
         if not input_ids.is_cuda:
             flat = input_ids.reshape(-1).to(torch.int64)
-            output = self.weight.index_select(0, flat)
+            output = self.weight.index_select(0, flat).to(torch.float32)
             return output.reshape(*original_shape, self.embedding_dim)
 
         indices_flat = input_ids.reshape(-1).to(torch.int32).contiguous()
         output = torch.empty(
-            (batch_size, self.embedding_dim), dtype=torch.float32, device=indices_flat.device
+            (batch_size, self.embedding_dim), dtype=self.weight.dtype, device=indices_flat.device
         )
 
         block = 256
@@ -869,7 +869,7 @@ class Embedding:
             BLOCK_SIZE=block,
         )
 
-        return output.reshape(*original_shape, self.embedding_dim)
+        return output.reshape(*original_shape, self.embedding_dim).to(torch.float32)
 
 
 def softmax(x: torch.Tensor, axis: int = -1) -> torch.Tensor:
