@@ -283,13 +283,14 @@ def flash_attention_fwd_triton(
     out = torch.empty((BH, Q, D), device=q.device, dtype=torch.float32)
 
     # Compute block sizes that fit within 64 KB shared memory.
-    # tl.dot allocates ~(BLOCK_M + BLOCK_N) * BLOCK_D * 4 bytes.
-    # BLOCK_D must be >= head_dim (power of two) for correct loads.
+    # Triton allocates (2*BLOCK_M + BLOCK_N) * BLOCK_D * 4 bytes:
+    #   q_tile (BLOCK_M, BLOCK_D) + acc (BLOCK_M, BLOCK_D) + k/v tiles (BLOCK_N, BLOCK_D).
+    # BLOCK_D must be >= head_dim and a power of two for correct loads.
     BLOCK_D = next_power_of_two(D)
-    shm_budget = 49152  # 48 KB — conservative limit with headroom
-    max_tiles = max(32, shm_budget // (BLOCK_D * 4))
-    BLOCK_N = max(16, min(64, max_tiles // 3))
-    BLOCK_M = max(16, min(128, max_tiles - BLOCK_N))
+    shm_budget = 49152  # 48 KB — leaves headroom below the 64 KB hardware limit
+    max_sum = max(32, shm_budget // (BLOCK_D * 4))  # budget for (2*BLOCK_M + BLOCK_N)
+    BLOCK_N = max(16, min(64, max_sum // 3))
+    BLOCK_M = max(16, min(64, (max_sum - BLOCK_N) // 2))
 
     grid = (triton.cdiv(Q, BLOCK_M), BH)
 
