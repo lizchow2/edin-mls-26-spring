@@ -849,6 +849,62 @@ def print_summary(component_results, attention_results, linear_results):
             print(f"  {'Full MLP (SwiGLU)':<25} {linear_results['full_mlp']:>10.2f}ms")
 
 
+def profile_kernel_direct(seq_len=256, num_runs=10):
+    """Benchmark the folder's actual attention kernel at a controlled sequence length."""
+    import torch
+
+    try:
+        from flash import scaled_dot_product_attention
+        impl_name = 'flash.py (flash attention)'
+    except ImportError:
+        from attention import scaled_dot_product_attention
+        impl_name = 'attention.py (standard triton)'
+
+    print(f"\n{'='*70}")
+    print(f"KERNEL DIRECT BENCHMARK: {impl_name}")
+    print(f"{'='*70}")
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    B, H, D = 1, 16, 128  # matches GLM-ASR text decoder config
+    Q = K = seq_len
+
+    print(f"\nConfig: B={B}, H={H}, seq_len={seq_len}, head_dim={D}")
+    print(f"Attention matrix size: {Q}x{K} = {Q*K} elements ({Q*K*4/1024:.1f} KB)")
+
+    q = torch.randn(B, H, Q, D, device=device, dtype=torch.float32)
+    k = torch.randn(B, H, K, D, device=device, dtype=torch.float32)
+    v = torch.randn(B, H, K, D, device=device, dtype=torch.float32)
+
+    timer = TorchTimer()
+
+    print(f"\nWarming up (3 runs)...")
+    for _ in range(3):
+        out = scaled_dot_product_attention(q, k, v)
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+
+    times = []
+    for _ in range(num_runs):
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        timer.start()
+        out = scaled_dot_product_attention(q, k, v)
+        elapsed = timer.stop()
+        times.append(elapsed)
+
+    print(f"\nResults ({num_runs} runs, post-warmup):")
+    print(f"  Mean:   {np.mean(times):.3f}ms")
+    print(f"  Std:    {np.std(times):.3f}ms")
+    print(f"  Min:    {np.min(times):.3f}ms")
+    print(f"  Max:    {np.max(times):.3f}ms")
+
+    bytes_moved = 4 * B * H * seq_len * D * 4  # Q+K+V+O tensors * float32
+    bandwidth_gb = bytes_moved / (np.mean(times) / 1000) / 1e9
+    print(f"  Effective memory bandwidth: {bandwidth_gb:.1f} GB/s")
+
+    return times
+
+
 def run_nsys_profile(folder, audio_path=None):
     """Run Nsight Systems profiling."""
     import subprocess
@@ -883,6 +939,7 @@ def main():
     parser.add_argument('--nsys', action='store_true', help='Run Nsight Systems profiling')
     parser.add_argument('--attention-only', action='store_true', help='Only profile attention ops')
     parser.add_argument('--linear-only', action='store_true', help='Only profile linear ops')
+    parser.add_argument('--kernel-only', action='store_true', help="Benchmark the folder's actual attention kernel directly")
     parser.add_argument('--seq-len', type=int, default=256, help='Sequence length for micro-benchmarks')
     args = parser.parse_args()
 
@@ -910,6 +967,17 @@ def main():
             profile_linear_ops_torch(seq_len=args.seq_len, num_runs=args.runs)
         else:
             profile_linear_ops(seq_len=args.seq_len, num_runs=args.runs)
+        return 0
+
+    if args.kernel_only:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        folder_path = os.path.join(script_dir, args.folder)
+        sys.path.insert(0, folder_path)
+        for mod_name in list(sys.modules.keys()):
+            if mod_name in ['attention', 'flash']:
+                del sys.modules[mod_name]
+        profile_kernel_direct(seq_len=args.seq_len, num_runs=args.runs)
+        sys.path.remove(folder_path)
         return 0
 
     # Full profiling
@@ -947,7 +1015,7 @@ def main():
 
     # Clear cached modules
     for mod_name in list(sys.modules.keys()):
-        if mod_name in ['weight_loader', 'model', 'layers', 'attention', 'rope', 'conv']:
+        if mod_name in ['weight_loader', 'model', 'layers', 'attention', 'flash', 'rope', 'conv']:
             del sys.modules[mod_name]
 
     print(f"\nLoading model from {args.folder}...")
