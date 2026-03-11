@@ -296,10 +296,10 @@ def load_model_from_hf(model_name: str = "zai-org/GLM-ASR-Nano-2512"):
     # Try local cache first, fall back to downloading
     try:
         processor = AutoProcessor.from_pretrained(model_name, local_files_only=True)
-    except Exception:
+    except (OSError, EnvironmentError):
         try:
             processor = AutoProcessor.from_pretrained(model_name)
-        except Exception:
+        except (OSError, EnvironmentError):
             processor = AutoProcessor.from_pretrained(model_name, use_fast=False)
 
 
