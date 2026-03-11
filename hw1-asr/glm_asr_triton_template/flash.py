@@ -250,7 +250,9 @@ def flash_attention_fwd_triton(
     FlashAttention forward pass.
 
     Notes:
-    - Block sizes are chosen automatically via @triton.autotune.
+    - Block sizes (BLOCK_M/N/D) are selected in the Python wrapper (e.g., via
+      simple heuristics) and passed as constexpr arguments to the Triton kernel;
+      this implementation does not currently use @triton.autotune.
     - attention_mask must be 4D (B, H, Q, K) or (B, 1, Q, K); it is added to
       scores inside the kernel before the online softmax step.
     """
