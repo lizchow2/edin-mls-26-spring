@@ -82,27 +82,6 @@ Online softmax fixes this with one key identity:
             all the keys!
             """
 
-@triton.jit
-def online_softmax(x_ptr, y_ptr, stride_x, stride_y, n_cols, BLOCK_SIZE: tl.constexpr):
-    """
-    Numerically stable softmax over last dimension.
-    Grid: (n_rows,)
-    """
-    row = tl.program_id(0)
-
-    read_row = x_ptr + row * stride_x
-    write_row = y_ptr + row * stride_y
-    columns = tl.arange(0, BLOCK_SIZE)
-    mask = columns < n_cols
-    values = tl.load(read_row + columns, mask=mask, other=float('-inf'))
-
-    max_val = tl.max(values, axis=0)
-    values = values - max_val
-    values = tl.exp(values)
-    sum_val = tl.sum(values, axis=0)
-    values = values / sum_val
-
-    tl.store(write_row + columns, values, mask=mask)
 
 
 @triton.jit
