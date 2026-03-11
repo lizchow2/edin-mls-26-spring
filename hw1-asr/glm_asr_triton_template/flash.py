@@ -246,16 +246,16 @@ def flash_attention_fwd_triton(
         scale = 1.0 / math.sqrt(D)
 
     BH = B * H
-    q_flat = q.reshape(BH, Q, D).to(torch.float32).contiguous()
-    k_flat = k.reshape(BH, K, D).to(torch.float32).contiguous()
-    v_flat = v.reshape(BH, K, D).to(torch.float32).contiguous()
+    q_flat = q.reshape(BH, Q, D)
+    k_flat = k.reshape(BH, K, D)
+    v_flat = v.reshape(BH, K, D)
 
     # Prepare mask: expand to (B, H, Q, K) then flatten to (BH, Q, K)
 
     if attention_mask is not None:
         assert attention_mask.shape[-2:] == (Q, K) 
         if attention_mask.ndim == 4:
-            mask_flat = attention_mask.expand(B, H, Q, K).contiguous().reshape(BH, Q, K).to(torch.float32).contiguous()
+            mask_flat = attention_mask.expand(B, H, Q, K).reshape(BH, Q, K)
         else:
             raise ValueError(f"attention_mask must be 4D (B, H, Q, K) or (B, 1, Q, K), got {attention_mask.shape}")
     else:
