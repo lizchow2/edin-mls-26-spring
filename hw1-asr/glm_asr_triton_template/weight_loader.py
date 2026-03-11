@@ -92,6 +92,7 @@ def load_embedding_weight_from_hf(triton_emb, hf_weight):
 def load_weights_from_hf_model(model, hf_model) -> None:
     """
     Load weights from HuggingFace GLM-ASR model into Triton model.
+
     """
     hf_state = hf_model.state_dict()
 
@@ -248,8 +249,12 @@ def load_weights_from_hf_model(model, hf_model) -> None:
 def load_model_from_hf(model_name: str = "zai-org/GLM-ASR-Nano-2512"):
     """
     Load GLM-ASR model from HuggingFace and create Triton version.
+
     """
     from transformers import AutoProcessor, GlmAsrForConditionalGeneration, AutoConfig
+
+
+
     from model import GlmAsrModel
 
     print(f"Loading HuggingFace model: {model_name}")
@@ -272,9 +277,34 @@ def load_model_from_hf(model_name: str = "zai-org/GLM-ASR-Nano-2512"):
         model_name, torch_dtype=torch.float32, device_map="cpu"
     )
 
-    processor = AutoProcessor.from_pretrained(model_name)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    # Try local cache first, fall back to downloading
+    try:
+        processor = AutoProcessor.from_pretrained(model_name, local_files_only=True)
+    except (OSError, EnvironmentError):
+        try:
+            processor = AutoProcessor.from_pretrained(model_name)
+        except (OSError, EnvironmentError):
+            processor = AutoProcessor.from_pretrained(model_name, use_fast=False)
+
 
     load_weights_from_hf_model(triton_model, hf_model)
+
 
     del hf_model
     import gc
