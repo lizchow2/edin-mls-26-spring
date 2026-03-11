@@ -335,47 +335,52 @@ def swiglu_fused_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
 ):
     """Fused SwiGLU: SiLU(x @ gate) * (x @ up)."""
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    pid = tl.program_id(axis=0)
+    num_pid_along_M = tl.cdiv(M, BLOCK_M)
+    num_pid_along_N = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_SIZE * num_pid_along_N
+
+    group_id = pid // num_pid_in_group
+    first_pid_in_group_along_M = group_id * GROUP_SIZE
+    group_size_adj = min(num_pid_along_M - first_pid_in_group_along_M, GROUP_SIZE)
+
+    pid_m = first_pid_in_group_along_M + ((pid % num_pid_in_group) % group_size_adj)
+    pid_n = (pid % num_pid_in_group) // group_size_adj
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
 
+    a_offsets = offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    gate_offsets = offs_k[:, None] * stride_gk + offs_n[None, :] * stride_gn
+    up_offsets = offs_k[:, None] * stride_uk + offs_n[None, :] * stride_un
+
     gate_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     up_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    for k in range(0, K, BLOCK_K):
-        a = tl.load(
-            a_ptr + offs_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak,
-            mask=(offs_m[:, None] < M) & (k + offs_k[None, :] < K),
-            other=0.0,
-        )
-        gate_w = tl.load(
-            gate_ptr + (k + offs_k[:, None]) * stride_gk + offs_n[None, :] * stride_gn,
-            mask=(k + offs_k[:, None] < K) & (offs_n[None, :] < N),
-            other=0.0,
-        )
-        up_w = tl.load(
-            up_ptr + (k + offs_k[:, None]) * stride_uk + offs_n[None, :] * stride_un,
-            mask=(k + offs_k[:, None] < K) & (offs_n[None, :] < N),
-            other=0.0,
-        )
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        mask = offs_k < K - k * BLOCK_K
+        a = tl.load(a_ptr + a_offsets, mask=mask[None, :], other=0.0)
+        gate_w = tl.load(gate_ptr + gate_offsets, mask=mask[:, None], other=0.0)
+        up_w = tl.load(up_ptr + up_offsets, mask=mask[:, None], other=0.0)
 
-        gate_acc += tl.dot(a, gate_w)
-        up_acc += tl.dot(a, up_w)
+        gate_acc = tl.dot(a, gate_w, acc=gate_acc)
+        up_acc = tl.dot(a, up_w, acc=up_acc)
+
+        a_offsets += BLOCK_K * stride_ak
+        gate_offsets += BLOCK_K * stride_gk
+        up_offsets += BLOCK_K * stride_uk
 
     sigmoid = 1.0 / (1.0 + tl.exp(-gate_acc))
     gate_act = gate_acc * sigmoid
     out = gate_act * up_acc
 
-    tl.store(
-        c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
-        out,
-        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
-    )
+    c_offsets = offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptr + c_offsets, out, mask=c_mask)
 
 
 @triton.jit
@@ -1024,8 +1029,7 @@ class MLP:
         )
 
         grid = (
-            triton.cdiv(M_pad, self.TILE_M),
-            triton.cdiv(N_pad, self.TILE_N),
+            triton.cdiv(M_pad, self.TILE_M) * triton.cdiv(N_pad, self.TILE_N),
         )
         swiglu_fused_kernel[grid](
             x_padded,
@@ -1046,6 +1050,7 @@ class MLP:
             BLOCK_M=self.TILE_M,
             BLOCK_N=self.TILE_N,
             BLOCK_K=self.TILE_K,
+            GROUP_SIZE=8,
         )
 
         if M != M_pad or N != N_pad:
