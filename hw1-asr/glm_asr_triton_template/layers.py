@@ -13,6 +13,7 @@ import numpy as np
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 
 # ============================================================================
@@ -156,15 +157,14 @@ def gelu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(0)
     offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offs < n_elements
-
     x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
 
     sqrt_2_over_pi = 0.7978845608028654
     x3 = x * x * x
     inner = sqrt_2_over_pi * (x + 0.044715 * x3)
-    y = x * 0.5 * (1.0 + 2 * tl.sigmoid(2 * inner) - 1)
-
+    y = x * 0.5 * (1.0 + libdevice.tanh(inner))
     tl.store(y_ptr + offs, y, mask=mask)
+
 
 
 @triton.jit
