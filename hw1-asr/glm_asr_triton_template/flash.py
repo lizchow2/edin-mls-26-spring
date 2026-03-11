@@ -82,27 +82,6 @@ Online softmax fixes this with one key identity:
             all the keys!
             """
 
-@triton.jit
-def online_softmax(x_ptr, y_ptr, stride_x, stride_y, n_cols, BLOCK_SIZE: tl.constexpr):
-    """
-    Numerically stable softmax over last dimension.
-    Grid: (n_rows,)
-    """
-    row = tl.program_id(0)
-
-    read_row = x_ptr + row * stride_x
-    write_row = y_ptr + row * stride_y
-    columns = tl.arange(0, BLOCK_SIZE)
-    mask = columns < n_cols
-    values = tl.load(read_row + columns, mask=mask, other=float('-inf'))
-
-    max_val = tl.max(values, axis=0)
-    values = values - max_val
-    values = tl.exp(values)
-    sum_val = tl.sum(values, axis=0)
-    values = values / sum_val
-
-    tl.store(write_row + columns, values, mask=mask)
 
 
 @triton.jit
@@ -250,7 +229,9 @@ def flash_attention_fwd_triton(
     FlashAttention forward pass.
 
     Notes:
-    - Block sizes are chosen automatically via @triton.autotune.
+    - Block sizes (BLOCK_M/N/D) are selected in the Python wrapper (e.g., via
+      simple heuristics) and passed as constexpr arguments to the Triton kernel;
+      this implementation does not currently use @triton.autotune.
     - attention_mask must be 4D (B, H, Q, K) or (B, 1, Q, K); it is added to
       scores inside the kernel before the online softmax step.
     """
@@ -268,6 +249,7 @@ def flash_attention_fwd_triton(
     q_flat = q.reshape(BH, Q, D)
     k_flat = k.reshape(BH, K, D)
     v_flat = v.reshape(BH, K, D)
+
     # Prepare mask: expand to (B, H, Q, K) then flatten to (BH, Q, K)
     if attention_mask is not None:
         assert attention_mask.shape[-2:] == (Q, K) 
