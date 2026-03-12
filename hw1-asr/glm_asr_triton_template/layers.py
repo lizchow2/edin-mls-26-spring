@@ -204,6 +204,7 @@ def linear_kernel_tf32(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    GROUP_SIZE: tl.constexpr
 ):
     """
     TF32-style matmul: output = A @ B.
@@ -213,33 +214,40 @@ def linear_kernel_tf32(
 
     Grid: (M // BLOCK_M, N // BLOCK_N)
     """
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    pid = tl.program_id(axis=0)
+    num_pid_along_M = tl.cdiv(M, BLOCK_M)
+    num_pid_along_N = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_SIZE * num_pid_along_N
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK_K)
+    group_id = pid // num_pid_in_group
+    first_pid_in_group_along_M = group_id * GROUP_SIZE # tells us the first row in the group
+    group_size_adj = min(num_pid_along_M - first_pid_in_group_along_M, GROUP_SIZE)
 
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    pid_M = first_pid_in_group_along_M + ((pid % num_pid_in_group) % group_size_adj)
+    pid_N = (pid % num_pid_in_group) // group_size_adj
 
-    for k in range(0, K, BLOCK_K):
-        a = tl.load(
-            a_ptr + offs_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak,
-            mask=(offs_m[:, None] < M) & (k + offs_k[None, :] < K),
-            other=0.0,
-        )
-        b = tl.load(
-            b_ptr + (k + offs_k[:, None]) * stride_bk + offs_n[None, :] * stride_bn,
-            mask=(k + offs_k[:, None] < K) & (offs_n[None, :] < N),
-            other=0.0,
-        )
-        acc += tl.dot(a, b)
+    offsets_M = pid_M * BLOCK_M + tl.arange(0, BLOCK_M) 
+    offsets_N = pid_N * BLOCK_N + tl.arange(0, BLOCK_N)
+    offsets_K = tl.arange(0, BLOCK_K)
+    a_offsets = offsets_M[:, None] * stride_am + offsets_K[None, :] * stride_ak 
+    b_offsets = offsets_K[:, None] * stride_bk + offsets_N[None, :] * stride_bn
+    
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    tl.store(
-        c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
-        acc,
-        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
-    )
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        mask = offsets_K < K - k * BLOCK_K
+        a = tl.load(a_ptr + a_offsets, mask=mask[None, :], other=0.0)
+        b = tl.load(b_ptr + b_offsets, mask=mask[:, None], other=0.0)
+
+        accumulator = tl.dot(a, b, acc=accumulator)
+
+        a_offsets += BLOCK_K * stride_ak
+        b_offsets += BLOCK_K * stride_bk
+
+    c_offsets = offsets_M[:, None] * stride_cm + offsets_N[None, :] * stride_cn
+    c_mask = (offsets_M[:, None] < M) & (offsets_N[None, :] < N)
+    
+    tl.store(c_ptr + c_offsets, accumulator, mask=c_mask)
 
 
 @triton.jit
@@ -259,38 +267,51 @@ def linear_gelu_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    GROUP_SIZE: tl.constexpr
 ):
     """Fused Linear + GELU."""
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    pid = tl.program_id(axis=0)
+    num_pid_along_M = tl.cdiv(M, BLOCK_M)
+    num_pid_along_N = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_SIZE * num_pid_along_N
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, BLOCK_K)
+    group_id = pid // num_pid_in_group
+    first_pid_in_group_along_M = group_id * GROUP_SIZE # tells us the first row in the group
+    group_size_adj = min(num_pid_along_M - first_pid_in_group_along_M, GROUP_SIZE)
 
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k in range(0, K, BLOCK_K):
-        a = tl.load(
-            a_ptr + offs_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak,
-            mask=(offs_m[:, None] < M) & (k + offs_k[None, :] < K),
-            other=0.0,
-        )
-        b = tl.load(
-            b_ptr + (k + offs_k[:, None]) * stride_bk + offs_n[None, :] * stride_bn,
-            mask=(k + offs_k[:, None] < K) & (offs_n[None, :] < N),
-            other=0.0,
-        )
-        acc += tl.dot(a, b)
+    pid_M = first_pid_in_group_along_M + ((pid % num_pid_in_group) % group_size_adj)
+    pid_N = (pid % num_pid_in_group) // group_size_adj
+
+    offsets_M = pid_M * BLOCK_M + tl.arange(0, BLOCK_M) 
+    offsets_N = pid_N * BLOCK_N + tl.arange(0, BLOCK_N)
+    offsets_K = tl.arange(0, BLOCK_K)
+    a_offsets = offsets_M[:, None] * stride_am + offsets_K[None, :] * stride_ak 
+    b_offsets = offsets_K[:, None] * stride_bk + offsets_N[None, :] * stride_bn
+    
+    accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        mask = offsets_K < K - k * BLOCK_K
+        a = tl.load(a_ptr + a_offsets, mask=mask[None, :], other=0.0)
+        b = tl.load(b_ptr + b_offsets, mask=mask[:, None], other=0.0)
+
+        accumulator = tl.dot(a, b, acc=accumulator)
+
+        a_offsets += BLOCK_K * stride_ak
+        b_offsets += BLOCK_K * stride_bk
+
+    c_offsets = offsets_M[:, None] * stride_cm + offsets_N[None, :] * stride_cn
+    c_mask = (offsets_M[:, None] < M) & (offsets_N[None, :] < N)
 
     sqrt_2_over_pi = 0.7978845608028654
-    acc3 = acc * acc * acc
-    inner = sqrt_2_over_pi * (acc + 0.044715 * acc3)
-    acc = acc * 0.5 * (1.0 + tl.libdevice.tanh(inner))
+    acc3 = accumulator * accumulator * accumulator
+    inner = sqrt_2_over_pi * (accumulator + 0.044715 * acc3)
+    accumulator = accumulator * 0.5 * (1.0 + tl.libdevice.tanh(inner))
 
     tl.store(
-        c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
-        acc,
-        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+        c_ptr + c_offsets,
+        accumulator,
+        mask=c_mask
     )
 
 
@@ -314,47 +335,52 @@ def swiglu_fused_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
 ):
     """Fused SwiGLU: SiLU(x @ gate) * (x @ up)."""
-    pid_m = tl.program_id(0)
-    pid_n = tl.program_id(1)
+    pid = tl.program_id(axis=0)
+    num_pid_along_M = tl.cdiv(M, BLOCK_M)
+    num_pid_along_N = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_SIZE * num_pid_along_N
+
+    group_id = pid // num_pid_in_group
+    first_pid_in_group_along_M = group_id * GROUP_SIZE
+    group_size_adj = min(num_pid_along_M - first_pid_in_group_along_M, GROUP_SIZE)
+
+    pid_m = first_pid_in_group_along_M + ((pid % num_pid_in_group) % group_size_adj)
+    pid_n = (pid % num_pid_in_group) // group_size_adj
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
 
+    a_offsets = offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    gate_offsets = offs_k[:, None] * stride_gk + offs_n[None, :] * stride_gn
+    up_offsets = offs_k[:, None] * stride_uk + offs_n[None, :] * stride_un
+
     gate_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     up_acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    for k in range(0, K, BLOCK_K):
-        a = tl.load(
-            a_ptr + offs_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak,
-            mask=(offs_m[:, None] < M) & (k + offs_k[None, :] < K),
-            other=0.0,
-        )
-        gate_w = tl.load(
-            gate_ptr + (k + offs_k[:, None]) * stride_gk + offs_n[None, :] * stride_gn,
-            mask=(k + offs_k[:, None] < K) & (offs_n[None, :] < N),
-            other=0.0,
-        )
-        up_w = tl.load(
-            up_ptr + (k + offs_k[:, None]) * stride_uk + offs_n[None, :] * stride_un,
-            mask=(k + offs_k[:, None] < K) & (offs_n[None, :] < N),
-            other=0.0,
-        )
+    for k in range(0, tl.cdiv(K, BLOCK_K)):
+        mask = offs_k < K - k * BLOCK_K
+        a = tl.load(a_ptr + a_offsets, mask=mask[None, :], other=0.0)
+        gate_w = tl.load(gate_ptr + gate_offsets, mask=mask[:, None], other=0.0)
+        up_w = tl.load(up_ptr + up_offsets, mask=mask[:, None], other=0.0)
 
-        gate_acc += tl.dot(a, gate_w)
-        up_acc += tl.dot(a, up_w)
+        gate_acc = tl.dot(a, gate_w, acc=gate_acc)
+        up_acc = tl.dot(a, up_w, acc=up_acc)
+
+        a_offsets += BLOCK_K * stride_ak
+        gate_offsets += BLOCK_K * stride_gk
+        up_offsets += BLOCK_K * stride_uk
 
     sigmoid = 1.0 / (1.0 + tl.exp(-gate_acc))
     gate_act = gate_acc * sigmoid
     out = gate_act * up_acc
 
-    tl.store(
-        c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
-        out,
-        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
-    )
+    c_offsets = offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    c_mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(c_ptr + c_offsets, out, mask=c_mask)
 
 
 @triton.jit
@@ -802,9 +828,9 @@ class Linear:
         )
 
         grid = (
-            triton.cdiv(M_padded, self.TILE_M),
-            triton.cdiv(self._N_padded, self.TILE_N),
+            triton.cdiv(M_padded, self.TILE_M) * triton.cdiv(self._N_padded, self.TILE_N),
         )
+
         linear_kernel_tf32[grid](
             x_padded,
             self._weight_t_padded,
@@ -821,6 +847,7 @@ class Linear:
             BLOCK_M=self.TILE_M,
             BLOCK_N=self.TILE_N,
             BLOCK_K=self.TILE_K,
+            GROUP_SIZE=8,
         )
 
         output = output[:M, :N]
@@ -1002,8 +1029,7 @@ class MLP:
         )
 
         grid = (
-            triton.cdiv(M_pad, self.TILE_M),
-            triton.cdiv(N_pad, self.TILE_N),
+            triton.cdiv(M_pad, self.TILE_M) * triton.cdiv(N_pad, self.TILE_N),
         )
         swiglu_fused_kernel[grid](
             x_padded,
@@ -1024,6 +1050,7 @@ class MLP:
             BLOCK_M=self.TILE_M,
             BLOCK_N=self.TILE_N,
             BLOCK_K=self.TILE_K,
+            GROUP_SIZE=8,
         )
 
         if M != M_pad or N != N_pad:
@@ -1108,8 +1135,7 @@ class EncoderMLP:
         )
 
         grid = (
-            triton.cdiv(M_pad, self.TILE_M),
-            triton.cdiv(N_pad, self.TILE_N),
+            triton.cdiv(M_pad, self.TILE_M) * triton.cdiv(N_pad, self.TILE_N),
         )
         linear_gelu_kernel[grid](
             x_padded,
@@ -1127,6 +1153,7 @@ class EncoderMLP:
             BLOCK_M=self.TILE_M,
             BLOCK_N=self.TILE_N,
             BLOCK_K=self.TILE_K,
+            GROUP_SIZE=8
         )
 
         if M != M_pad or N != N_pad:
