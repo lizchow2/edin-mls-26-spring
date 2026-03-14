@@ -629,7 +629,7 @@ class MultiModalProjector:
 class GlmAsrModel:
     """GLM-ASR model using Torch + Triton kernels."""
 
-    def __init__(self, config: GlmAsrConfig):
+    def __init__(self, config: GlmAsrConfig, is_draft: bool = False):
         self.config = config
 
         # Components
@@ -639,6 +639,15 @@ class GlmAsrModel:
 
         # LM head (tied with embedding)
         self.lm_head = Linear(config.text_hidden_size, config.text_vocab_size, bias=False)
+        # Draft model for speculative decoding
+        if not is_draft:
+            self.draft_model = self._create_draft_model()
+        else:
+            self.draft_model = None
+
+    def _create_draft_model(self):
+        from speculative_simple import create_draft_model
+        return create_draft_model(self.config)
 
     def encode_audio(
         self,
@@ -729,7 +738,7 @@ class GlmAsrModel:
         max_new_tokens: int = 256,
         temperature: float = 1.0,
         top_k: int = 50,
-        audio_pad_token_id: int = 59260  # <|pad|> token for audio
+        audio_pad_token_id: int = 59260,  # <|pad|> token for audio
     ) -> torch.Tensor:
         """Generate tokens from audio with proper chat template format.
 
@@ -815,52 +824,64 @@ class GlmAsrModel:
             eos_token_ids, dtype=torch.int64, device=generated.device
         )
 
-        # Autoregressive generation
-        for _ in range(max_new_tokens):
-            # Get logits for next token
-            logits = self.decode(inputs_embeds=inputs_embeds)
-            next_token_logits = logits[:, -1, :] / temperature
+        # # Autoregressive generation
+        # for _ in range(max_new_tokens):
+        #     # Get logits for next token
+        #     logits = self.decode(inputs_embeds=inputs_embeds)
+        #     next_token_logits = logits[:, -1, :] / temperature
 
-            # Top-k sampling
-            if top_k > 0 and top_k < next_token_logits.shape[-1]:
-                top_k_indices = torch.argsort(next_token_logits, dim=-1)[:, -top_k:]
-                top_k_logits = torch.gather(next_token_logits, dim=-1, index=top_k_indices)
+        #     # Top-k sampling
+        #     if top_k > 0 and top_k < next_token_logits.shape[-1]:
+        #         top_k_indices = torch.argsort(next_token_logits, dim=-1)[:, -top_k:]
+        #         top_k_logits = torch.gather(next_token_logits, dim=-1, index=top_k_indices)
 
-                # Softmax
-                top_k_logits_shifted = top_k_logits - torch.max(
-                    top_k_logits, dim=-1, keepdim=True
-                ).values
-                exp_logits = torch.exp(top_k_logits_shifted)
-                probs = exp_logits / torch.sum(exp_logits, dim=-1, keepdim=True)
+        #         # Softmax
+        #         top_k_logits_shifted = top_k_logits - torch.max(
+        #             top_k_logits, dim=-1, keepdim=True
+        #         ).values
+        #         exp_logits = torch.exp(top_k_logits_shifted)
+        #         probs = exp_logits / torch.sum(exp_logits, dim=-1, keepdim=True)
 
-                # Sample
-                cumprobs = torch.cumsum(probs, dim=-1)
-                samples = torch.rand((batch_size, 1), device=next_token_logits.device)
-                next_token_idx = torch.argmax((cumprobs >= samples).to(torch.float32), dim=-1)
-                next_token = torch.gather(
-                    top_k_indices,
-                    dim=-1,
-                    index=next_token_idx[:, None],
-                )
-            else:
-                next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+        #         # Sample
+        #         cumprobs = torch.cumsum(probs, dim=-1)
+        #         samples = torch.rand((batch_size, 1), device=next_token_logits.device)
+        #         next_token_idx = torch.argmax((cumprobs >= samples).to(torch.float32), dim=-1)
+        #         next_token = torch.gather(
+        #             top_k_indices,
+        #             dim=-1,
+        #             index=next_token_idx[:, None],
+        #         )
+        #     else:
+        #         next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
 
-            # Append to generated
-            generated = torch.cat([generated, next_token], dim=1)
+        #     # Append to generated
+        #     generated = torch.cat([generated, next_token], dim=1)
 
-            # Check for EOS - mark sequences that generated any EOS token
-            next_token_flat = next_token.flatten()
-            is_eos = torch.any(
-                next_token_flat[:, None] == eos_token_ids_cp[None, :], dim=1
-            )
-            finished = finished | is_eos
+        #     # Check for EOS - mark sequences that generated any EOS token
+        #     next_token_flat = next_token.flatten()
+        #     is_eos = torch.any(
+        #         next_token_flat[:, None] == eos_token_ids_cp[None, :], dim=1
+        #     )
+        #     finished = finished | is_eos
 
-            # Stop if all sequences have finished
-            if torch.all(finished):
-                break
+        #     # Stop if all sequences have finished
+        #     if torch.all(finished):
+        #         break
 
-            # Update inputs_embeds with new token
-            new_embeds = self.text_decoder.embed_tokens(next_token)
-            inputs_embeds = torch.cat([inputs_embeds, new_embeds], dim=1)
+        #     # Update inputs_embeds with new token
+        #     new_embeds = self.text_decoder.embed_tokens(next_token)
+        #     inputs_embeds = torch.cat([inputs_embeds, new_embeds], dim=1)
+        from speculative_simple import speculative_decode
+        generated_tokens = speculative_decode(
+            target_model=self,
+            draft_model=self.draft_model,   # use self.draft_model
+            inputs_embeds=inputs_embeds,
+            max_new_tokens=max_new_tokens,
+            gamma=4,
+            temperature=temperature,
+            eos_token_id=self.config.eos_token_id
+                if isinstance(self.config.eos_token_id, int)
+                else self.config.eos_token_id[0],
+        )
 
-        return generated
+        return torch.cat([generated, generated_tokens], dim=1)
