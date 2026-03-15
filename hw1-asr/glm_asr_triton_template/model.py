@@ -17,7 +17,6 @@ from rope import RotaryEmbedding, apply_rotary_pos_emb
 from attention import scaled_dot_product_attention, MultiHeadAttention
 from conv import Conv1d, Conv1dSubsampler
 
-
 # ============================================================================
 # Configuration
 # ============================================================================
@@ -536,6 +535,7 @@ class TextDecoder:
         batch_size: int,
         max_seq_len: int,
         dtype=torch.float32,
+        device=None
     ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
         """Allocate KV buffers for all layers.
 
@@ -544,6 +544,10 @@ class TextDecoder:
         """
         head_dim = self.config.text_hidden_size // self.config.text_num_heads
         num_kv_heads = self.config.text_num_kv_heads
+
+        if device is None:
+            w = getattr(self.embed_tokens, "weight", None)
+            device = w.device if w is not None else torch.device("cpu")
 
         kv_buffers = []
         device = getattr(self.embed_tokens, "weight", None)
@@ -823,65 +827,68 @@ class GlmAsrModel:
         eos_token_ids_cp = torch.tensor(
             eos_token_ids, dtype=torch.int64, device=generated.device
         )
+        
+        past_key_values = None
+        # Autoregressive generation
+        for _ in range(max_new_tokens):
+            # Get logits for next token
+            # logits = self.decode(inputs_embeds=inputs_embeds)
+            if past_key_values is None:
+                # prefill — process full sequence
+                logits, past_key_values = self.decode(
+                    inputs_embeds=inputs_embeds,
+                    use_cache=True
+                )
+            else:
+                # decode — process only new token
+                new_embeds = self.text_decoder.embed_tokens(next_token)
+                logits, past_key_values = self.decode(
+                    inputs_embeds=new_embeds,
+                    use_cache=True,
+                    past_key_values=past_key_values
+                )
+            
+            next_token_logits = logits[:, -1, :] / temperature
 
-        # # Autoregressive generation
-        # for _ in range(max_new_tokens):
-        #     # Get logits for next token
-        #     logits = self.decode(inputs_embeds=inputs_embeds)
-        #     next_token_logits = logits[:, -1, :] / temperature
+            # Top-k sampling
+            if top_k > 0 and top_k < next_token_logits.shape[-1]:
+                top_k_indices = torch.argsort(next_token_logits, dim=-1)[:, -top_k:]
+                top_k_logits = torch.gather(next_token_logits, dim=-1, index=top_k_indices)
 
-        #     # Top-k sampling
-        #     if top_k > 0 and top_k < next_token_logits.shape[-1]:
-        #         top_k_indices = torch.argsort(next_token_logits, dim=-1)[:, -top_k:]
-        #         top_k_logits = torch.gather(next_token_logits, dim=-1, index=top_k_indices)
+                # Softmax
+                top_k_logits_shifted = top_k_logits - torch.max(
+                    top_k_logits, dim=-1, keepdim=True
+                ).values
+                exp_logits = torch.exp(top_k_logits_shifted)
+                probs = exp_logits / torch.sum(exp_logits, dim=-1, keepdim=True)
 
-        #         # Softmax
-        #         top_k_logits_shifted = top_k_logits - torch.max(
-        #             top_k_logits, dim=-1, keepdim=True
-        #         ).values
-        #         exp_logits = torch.exp(top_k_logits_shifted)
-        #         probs = exp_logits / torch.sum(exp_logits, dim=-1, keepdim=True)
+                # Sample
+                cumprobs = torch.cumsum(probs, dim=-1)
+                samples = torch.rand((batch_size, 1), device=next_token_logits.device)
+                next_token_idx = torch.argmax((cumprobs >= samples).to(torch.float32), dim=-1)
+                next_token = torch.gather(
+                    top_k_indices,
+                    dim=-1,
+                    index=next_token_idx[:, None],
+                )
+            else:
+                next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
 
-        #         # Sample
-        #         cumprobs = torch.cumsum(probs, dim=-1)
-        #         samples = torch.rand((batch_size, 1), device=next_token_logits.device)
-        #         next_token_idx = torch.argmax((cumprobs >= samples).to(torch.float32), dim=-1)
-        #         next_token = torch.gather(
-        #             top_k_indices,
-        #             dim=-1,
-        #             index=next_token_idx[:, None],
-        #         )
-        #     else:
-        #         next_token = torch.argmax(next_token_logits, dim=-1, keepdim=True)
+            # Append to generated
+            generated = torch.cat([generated, next_token], dim=1)
 
-        #     # Append to generated
-        #     generated = torch.cat([generated, next_token], dim=1)
+            # Check for EOS - mark sequences that generated any EOS token
+            next_token_flat = next_token.flatten()
+            is_eos = torch.any(
+                next_token_flat[:, None] == eos_token_ids_cp[None, :], dim=1
+            )
+            finished = finished | is_eos
 
-        #     # Check for EOS - mark sequences that generated any EOS token
-        #     next_token_flat = next_token.flatten()
-        #     is_eos = torch.any(
-        #         next_token_flat[:, None] == eos_token_ids_cp[None, :], dim=1
-        #     )
-        #     finished = finished | is_eos
+            # Stop if all sequences have finished
+            if torch.all(finished):
+                break
 
-        #     # Stop if all sequences have finished
-        #     if torch.all(finished):
-        #         break
-
-        #     # Update inputs_embeds with new token
-        #     new_embeds = self.text_decoder.embed_tokens(next_token)
-        #     inputs_embeds = torch.cat([inputs_embeds, new_embeds], dim=1)
-        from speculative_simple import speculative_decode
-        generated_tokens = speculative_decode(
-            target_model=self,
-            draft_model=self.draft_model,   # use self.draft_model
-            inputs_embeds=inputs_embeds,
-            max_new_tokens=max_new_tokens,
-            gamma=4,
-            temperature=temperature,
-            eos_token_id=self.config.eos_token_id
-                if isinstance(self.config.eos_token_id, int)
-                else self.config.eos_token_id[0],
-        )
-
-        return torch.cat([generated, generated_tokens], dim=1)
+            # # Update inputs_embeds with new token
+            # new_embeds = self.text_decoder.embed_tokens(next_token)
+            # inputs_embeds = torch.cat([inputs_embeds, new_embeds], dim=1)
+        return generated

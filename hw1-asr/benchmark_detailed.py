@@ -400,7 +400,12 @@ def detailed_profile_torch(model, input_features, input_ids, input_features_mask
     decode_times = []
     num_decode_steps = 10
 
-    logits = model.lm_head(hidden_states[:, -1:, :])
+    # logits = model.lm_head(hidden_states[:, -1:, :])
+    # prefill with KV cache first
+    logits, past_key_values = model.decode(
+        inputs_embeds=combined_embeds,
+        use_cache=True
+    )
     next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
 
     for _ in range(num_decode_steps):
@@ -408,8 +413,13 @@ def detailed_profile_torch(model, input_features, input_ids, input_features_mask
             torch.cuda.synchronize()
         timer.start()
         next_embed = embed_tokens(next_token)
-        step_hidden = model.text_decoder(inputs_embeds=next_embed)
-        step_logits = model.lm_head(step_hidden)
+        # step_hidden = model.text_decoder(inputs_embeds=next_embed)
+        # step_logits = model.lm_head(step_hidden)
+        step_logits, past_key_values = model.decode(
+            inputs_embeds=next_embed,
+            use_cache=True,
+            past_key_values=past_key_values
+        )
         next_token = torch.argmax(step_logits[:, -1, :], dim=-1, keepdim=True)
         elapsed = timer.stop()
         decode_times.append(elapsed)
@@ -858,7 +868,10 @@ def run_nsys_profile(folder, audio_path=None):
 
     cmd = [
         "nsys", "profile",
-        "--trace=cuda,nvtx",
+        "--trace=cuda,nvtx,osrt",      # Added osrt for better context
+        "--gpu-metrics-device=none",   # CRITICAL: This bypasses the UUID fatal error
+        "--sample=none",
+        "--trace-fork-before-exec=true",
         "--output", output_name,
         "--force-overwrite", "true",
         "python", os.path.join(script_dir, "benchmark_student.py"),
@@ -870,6 +883,7 @@ def run_nsys_profile(folder, audio_path=None):
 
     print(f"Running: {' '.join(cmd)}")
     subprocess.run(cmd, cwd=script_dir)
+    print(script_dir)
     print(f"\nProfile saved to: {output_name}.nsys-rep")
     print("Open with: nsys-ui " + output_name + ".nsys-rep")
 
