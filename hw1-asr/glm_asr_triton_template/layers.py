@@ -241,6 +241,16 @@ def linear_kernel_tf32(
         mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
     )
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=4),
+        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4),
+        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 64, 'BLOCK_K': 128}, num_warps=4),
+        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 128, 'BLOCK_K': 128}, num_warps=8),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4),
+    ],
+    key=['M', 'N', 'K'],
+)
 @triton.jit
 def linear_kernel_tf16(
     a_ptr,
@@ -281,12 +291,12 @@ def linear_kernel_tf16(
             a_ptr + offs_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak,
             mask=(offs_m[:, None] < M) & (k + offs_k[None, :] < K),
             other=0.0,
-        ).to(tl.float32) 
+        ).to(tl.float16) 
         b = tl.load(
             b_ptr + (k + offs_k[:, None]) * stride_bk + offs_n[None, :] * stride_bn,
             mask=(k + offs_k[:, None] < K) & (offs_n[None, :] < N),
             other=0.0,
-        ).to(tl.float32) 
+        ).to(tl.float16) 
         acc += tl.dot(a, b)
 
     tl.store(
