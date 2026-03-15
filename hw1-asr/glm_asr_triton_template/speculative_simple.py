@@ -1,6 +1,6 @@
 import torch
 from typing import List, Tuple, Optional
-from model import GlmAsrConfig, GlmAsrModel
+from model import GlmAsrConfig, GlmAsrModel, _move_decoder_to_device
 
 def norm_logits(logits: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
     """Convert raw logits to probability distribution."""
@@ -13,104 +13,145 @@ def sample(probs: torch.Tensor) -> torch.Tensor:
 def speculative_decode(
     target_model,
     draft_model,
-    inputs_embeds: torch.Tensor,      # already-built (1, seq_len, hidden) — audio+text combined
+    inputs_embeds: torch.Tensor,
     max_new_tokens: int,
     gamma: int = 4,
     temperature: float = 1.0,
-    eos_token_id: int = 2,
+    eos_token_ids: List[int] = None,
 ) -> torch.Tensor:
-    """
-    Speculative decoding using a draft model to propose tokens
-    and a target model to verify them.
-    """
+    
     device = inputs_embeds.device
+
+    if not getattr(draft_model, '_initialized', False):
+        _move_decoder_to_device(draft_model.text_decoder, device)
+        draft_model.lm_head.weight = draft_model.lm_head.weight.to(device)
+        copy_target_weights_to_draft(target_model, draft_model)
+        draft_model._initialized = True
+
+    if eos_token_ids is None:
+        eos_token_ids = [2]
+    eos_tensor = torch.tensor(eos_token_ids, dtype=torch.long, device=device)
+
+
+    batch_size = inputs_embeds.shape[0]
+    prefix_len = inputs_embeds.shape[1]
     generated = torch.zeros((1, 0), dtype=torch.long, device=device)
 
-    # current_embeds grows as we generate — starts as the audio+text prefix
-    current_embeds = inputs_embeds
+    # allocate KV buffers once for the full max sequence length
+    max_seq_len = prefix_len + max_new_tokens + gamma + 10  # small headroom
+    target_kv_buffers = target_model.text_decoder.allocate_kv_buffers(
+        batch_size, max_seq_len, dtype=torch.float32, device=device
+    )
+    draft_kv_buffers = draft_model.text_decoder.allocate_kv_buffers(
+        batch_size, max_seq_len, dtype=torch.float32, device=device
+    ) if gamma > 0 else None
+
+    # prefill — process the full input prefix once
+    hidden_states, cache_pos = target_model.text_decoder.forward_with_kv_buffers(
+        inputs_embeds, target_kv_buffers, cache_pos=0
+    )
+    target_prefill_logits = target_model.lm_head(hidden_states)
+
+    # draft model also needs to prefill its own cache
+    if gamma > 0:
+        _, _ = draft_model.text_decoder.forward_with_kv_buffers(
+            inputs_embeds, draft_kv_buffers, cache_pos=0
+        )
+
+    cache_pos = prefix_len
+
+    # sample first token from prefill
+    probs = norm_logits(target_prefill_logits[:, -1, :], temperature)
+    first_token = sample(probs)
+    generated = torch.cat([generated, first_token], dim=1)
+
+    if (first_token.unsqueeze(-1) == eos_tensor).any():
+        return generated
+
+    # decode loop — each iteration processes only NEW tokens
+    current_token = first_token  # (1, 1)
 
     while generated.shape[1] < max_new_tokens:
 
         # ------------------------------------------------
         # STEP 1: draft model proposes gamma tokens
+        # each step processes ONE token using the cache
         # ------------------------------------------------
-        draft_tokens = []   # the token ids chosen at each draft step
-        draft_probs  = []   # probability of each chosen token under draft model
+        draft_tokens = []
+        draft_probs  = []
 
-        x = current_embeds  # grows by one embedding each draft step
+        draft_token = current_token
+        d_cache_pos  = cache_pos  # draft starts from same position as target
 
         for _ in range(gamma):
-            # one forward pass of the draft model
-            logits = draft_model.decode(inputs_embeds=x)
-            probs  = norm_logits(logits[:, -1, :], temperature)  # (1, vocab_size)
+            draft_embed = draft_model.text_decoder.embed_tokens(draft_token)
+            hidden, d_cache_pos = draft_model.text_decoder.forward_with_kv_buffers(
+                draft_embed, draft_kv_buffers, cache_pos=d_cache_pos
+            )
+            logits = draft_model.lm_head(hidden)
+            probs  = norm_logits(logits[:, -1, :], temperature)
 
-            next_token = sample(probs)                            # (1, 1)              # scalar probability
-
+            next_token = sample(probs)
             draft_tokens.append(next_token)
-            draft_probs.append(probs) 
-
-            # embed the new token and append for next draft step
-            next_embed = draft_model.text_decoder.embed_tokens(next_token)  # (1, 1, hidden)
-            x = torch.cat([x, next_embed], dim=1)
-
-        # x is now current_embeds + gamma draft token embeddings
+            draft_probs.append(probs)
+            draft_token = next_token
 
         # ------------------------------------------------
-        # STEP 2: target model verifies all gamma tokens
-        # in a SINGLE forward pass
+        # STEP 2: target verifies all gamma tokens at once
+        # concatenate current_token + draft_tokens into one pass
         # ------------------------------------------------
-        target_logits = target_model.decode(inputs_embeds=x)
-        # shape: (1, prefix_len + gamma, vocab_size)
-
-        # we only care about the gamma positions where draft tokens were placed
-        # position -(gamma) through -1 in the sequence
-        prefix_len = current_embeds.shape[1]
+        if gamma > 0:
+            all_new_tokens = torch.cat([current_token] + draft_tokens, dim=1)  # (1, gamma+1)
+            all_new_embeds = target_model.text_decoder.embed_tokens(all_new_tokens)
+            hidden, new_cache_pos = target_model.text_decoder.forward_with_kv_buffers(
+                all_new_embeds, target_kv_buffers, cache_pos=cache_pos
+            )
+            target_logits = target_model.lm_head(hidden)  # (1, gamma+1, vocab)
+        else:
+            current_embed = target_model.text_decoder.embed_tokens(current_token)
+            hidden, new_cache_pos = target_model.text_decoder.forward_with_kv_buffers(
+                current_embed, target_kv_buffers, cache_pos=cache_pos
+            )
+            target_logits = target_model.lm_head(hidden)
 
         # ------------------------------------------------
         # STEP 3: rejection sampling
         # ------------------------------------------------
         accepted = 0
-        t = None  # the token we'll append after this round
+        t = None
 
         for i in range(gamma):
-            draft_token = draft_tokens[i][0, 0]  # scalar token id
+            draft_token_id = draft_tokens[i][0, 0]
+            target_probs_i = norm_logits(target_logits[:, i, :], temperature)
 
-            # target probability at position (prefix_len + i - 1)
-            # that's where target predicts what comes after position i
-            target_probs_i = norm_logits(
-                target_logits[:, prefix_len + i - 1, :], temperature
-            )
-            q = target_probs_i[0, draft_token]  # target prob for this token
-            p = draft_probs[i][0, draft_token]                 # draft prob for this token
-
+            q = target_probs_i[0, draft_token_id]
+            p = draft_probs[i][0, draft_token_id]
             r = torch.rand(1, device=device)
 
             if r < torch.min(torch.tensor(1.0, device=device), q / p):
-                # accept this draft token
                 accepted += 1
             else:
-                # reject — resample from adjusted distribution
                 adjusted = torch.clamp(target_probs_i - draft_probs[i], min=0)
                 adjusted = adjusted / adjusted.sum()
                 t = sample(adjusted)
                 break
 
         if t is None:
-            # all gamma tokens accepted — sample bonus token from target
             bonus_probs = norm_logits(target_logits[:, -1, :], temperature)
             t = sample(bonus_probs)
 
-        # keep only accepted draft tokens
-        accepted_tokens = torch.cat(draft_tokens[:accepted], dim=1)  # (1, accepted)
-        new_tokens = torch.cat([accepted_tokens, t], dim=1)          # (1, accepted+1)
+        if accepted > 0:
+            new_tokens = torch.cat(draft_tokens[:accepted] + [t], dim=1)
+        else:
+            new_tokens = t
+
         generated  = torch.cat([generated, new_tokens], dim=1)
 
-        # update current_embeds with accepted tokens + the final sampled token
-        new_embeds = target_model.text_decoder.embed_tokens(new_tokens)
-        current_embeds = torch.cat([current_embeds, new_embeds], dim=1)
-
-        # check for EOS in newly added tokens
-        if (new_tokens == eos_token_id).any():
+        # advance target cache to accepted position only
+        # roll back draft cache if tokens were rejected
+        cache_pos = cache_pos + 1 + accepted  # +1 for current_token, +accepted for drafts
+        current_token = t
+        if (new_tokens.unsqueeze(-1) == eos_tensor).any():
             break
 
     return generated
@@ -139,6 +180,53 @@ def create_draft_model(target_config: GlmAsrConfig) -> GlmAsrModel:
     )
     return GlmAsrModel(draft_config, is_draft=True)
 
+def copy_target_weights_to_draft(target_model, draft_model):
+    """
+    Copy first N layers of target text decoder into draft model.
+    Draft model must have same hidden_size as target.
+    """
+    num_draft_layers = draft_model.config.text_num_layers  # 14
+
+    # embed tokens — shared vocabulary, copy directly
+    draft_model.text_decoder.embed_tokens.weight = (
+        target_model.text_decoder.embed_tokens.weight.detach().clone()
+    )
+
+    # copy first num_draft_layers from target into draft
+    for i in range(num_draft_layers):
+        src = target_model.text_decoder.layers[i]
+        dst = draft_model.text_decoder.layers[i]
+
+        if i == 0:
+            print(f"Source layer attrs: {[a for a in vars(src) if 'proj' in a or 'mlp' in a]}")
+            print(f"Draft layer attrs:  {[a for a in vars(dst) if 'proj' in a or 'mlp' in a]}")
+            print(f"After copy — src q_proj device: {src.q_proj.weight.device}")
+            print(f"After copy — dst q_proj device: {dst.q_proj.weight.device}")
+
+        # layer norms
+        dst.input_layernorm.weight = src.input_layernorm.weight.detach().clone()
+        dst.post_attention_layernorm.weight = src.post_attention_layernorm.weight.detach().clone()
+
+        # attention projections
+        dst.q_proj.weight = src.q_proj.weight.detach().clone()
+        dst.k_proj.weight = src.k_proj.weight.detach().clone()
+        dst.v_proj.weight = src.v_proj.weight.detach().clone()
+        dst.o_proj.weight = src.o_proj.weight.detach().clone()
+
+        # mlp
+        dst.mlp.gate_proj.weight = src.mlp.gate_proj.weight.detach().clone()
+        dst.mlp.up_proj.weight   = src.mlp.up_proj.weight.detach().clone()
+        dst.mlp.down_proj.weight = src.mlp.down_proj.weight.detach().clone()
+
+    # final norm and lm head
+    draft_model.text_decoder.norm.weight = (
+        target_model.text_decoder.norm.weight.detach().clone()
+    )
+    draft_model.lm_head.weight = (
+        target_model.lm_head.weight.detach().clone()
+    )
+
+    print(f"Copied {num_draft_layers} layers from target to draft model")
 
 ###### Tests
 
