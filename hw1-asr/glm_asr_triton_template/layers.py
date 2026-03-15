@@ -241,6 +241,60 @@ def linear_kernel_tf32(
         mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
     )
 
+@triton.jit
+def linear_kernel_tf16(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    TF16-style matmul: output = A @ B.
+    A: (M, K), B: (K, N), C: (M, N)
+
+    *** TODO: Implement this kernel ***
+
+    Grid: (M // BLOCK_M, N // BLOCK_N)
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, K, BLOCK_K):
+        a = tl.load(
+            a_ptr + offs_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak,
+            mask=(offs_m[:, None] < M) & (k + offs_k[None, :] < K),
+            other=0.0,
+        ).to(tl.float32) 
+        b = tl.load(
+            b_ptr + (k + offs_k[:, None]) * stride_bk + offs_n[None, :] * stride_bn,
+            mask=(k + offs_k[:, None] < K) & (offs_n[None, :] < N),
+            other=0.0,
+        ).to(tl.float32) 
+        acc += tl.dot(a, b)
+
+    tl.store(
+        c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+        acc,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
 
 @triton.jit
 def linear_gelu_kernel(
@@ -728,11 +782,11 @@ class Linear:
             self._K_padded = pad_to_multiple(K, self.TILE_K)
             self._N_padded = pad_to_multiple(N, self.TILE_N)
 
-            weight_t = self.weight.t().contiguous()
+            weight_t = self.weight.t().contiguous().to(torch.float16)
             if self._K_padded > K or self._N_padded > N:
                 weight_pad = torch.zeros(
                     (self._K_padded, self._N_padded),
-                    dtype=torch.float32,
+                    dtype=torch.float16,
                     device=weight_t.device,
                 )
                 weight_pad[:K, :N] = weight_t
@@ -778,7 +832,7 @@ class Linear:
         K = self.in_features
         N = self.out_features
 
-        x_2d = x.reshape(M, K).to(torch.float32).contiguous()
+        x_2d = x.reshape(M, K).to(torch.float16).contiguous()
 
         if self.weight.device != x.device:
             self.weight = self.weight.to(x.device)
@@ -790,7 +844,7 @@ class Linear:
         if M_padded > M or self._K_padded > K:
             x_padded = torch.zeros(
                 (M_padded, self._K_padded),
-                dtype=torch.float32,
+                dtype=torch.float16,
                 device=x.device,
             )
             x_padded[:M, :K] = x_2d
@@ -805,7 +859,7 @@ class Linear:
             triton.cdiv(M_padded, self.TILE_M),
             triton.cdiv(self._N_padded, self.TILE_N),
         )
-        linear_kernel_tf32[grid](
+        linear_kernel_tf16[grid](
             x_padded,
             self._weight_t_padded,
             output,
