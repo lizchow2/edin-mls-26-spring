@@ -73,6 +73,5 @@ def run_triton_benchmark(cmd: str):
 
 @app.local_entrypoint()
 def main():
-    run_triton_benchmark.remote(
-        cmd = f"./benchmark.sh glm_asr_triton_example"
-    )
+    run_triton_benchmark.remote(cmd = f"./benchmark.sh glm_asr_triton_template --warmup 3")
+    # run_triton_benchmark.remote(cmd = f"python glm_asr_triton_template/layers.py")
