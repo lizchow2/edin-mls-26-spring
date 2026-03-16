@@ -643,15 +643,6 @@ class GlmAsrModel:
 
         # LM head (tied with embedding)
         self.lm_head = Linear(config.text_hidden_size, config.text_vocab_size, bias=False)
-        # Draft model for speculative decoding
-        if not is_draft:
-            self.draft_model = self._create_draft_model()
-        else:
-            self.draft_model = None
-
-    def _create_draft_model(self):
-        from speculative_simple import create_draft_model
-        return create_draft_model(self.config)
 
     def encode_audio(
         self,
