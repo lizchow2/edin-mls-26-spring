@@ -320,7 +320,7 @@ class AttentionBench:
     DEFAULT_BLOCK_SIZES = [16, 32, 64]   # BLOCK_M = BLOCK_N
 
     def run(self, seq_lens, block_sizes, runs, warmup,
-            B=1, H=16, D=64, save_dir=None, do_plot=False):
+            B=1, H=16, D=128, save_dir=None, do_plot=False):
         import triton
 
         device = _device()
@@ -1092,30 +1092,40 @@ class RoPEBench:
                     except Exception as e:
                         print(f"    [{label}, seq={sl}] skipped: {e}")
 
-            # PyTorch baseline
-            positions = torch.arange(sl, device=device, dtype=torch.float32)
-            inv_freq  = torch.arange(half_dims[0], device=device, dtype=torch.float32)
-            label = "pytorch"
-            try:
-                def _run_pt():
-                    freqs = positions[:, None] * inv_freq[None, :]
-                    torch.cos(freqs); torch.sin(freqs)
-                times = timed_run(_run_pt, warmup=warmup, runs=runs)
-                mean  = np.mean(times)
-                results[sl][label] = BenchResult(
-                    self.NAME, label, sl, "n/a",
-                    mean, np.std(times), np.min(times), np.max(times),
-                    NA, NA,
-                )
-            except Exception as e:
-                print(f"    [pytorch rope, seq={sl}] skipped: {e}")
+                # PyTorch baseline — matched to current half_dim for fair comparison
+                pt_label = f"pytorch_hd{half_dim}"
+                try:
+                    def _run_pt(positions=positions, inv_freq=inv_freq):
+                        freqs = positions[:, None] * inv_freq[None, :]
+                        torch.cos(freqs); torch.sin(freqs)
+                    times = timed_run(_run_pt, warmup=warmup, runs=runs)
+                    mean  = np.mean(times)
+                    results[sl][pt_label] = BenchResult(
+                        self.NAME, pt_label, sl, "n/a",
+                        mean, np.std(times), np.min(times), np.max(times),
+                        NA, NA,
+                    )
+                except Exception as e:
+                    print(f"    [pytorch rope hd={half_dim}, seq={sl}] skipped: {e}")
 
-        variants = sorted({v for sl in seq_lens if sl in results for v in results[sl]})
-        print_results(f"RoPE Benchmark  ({device})", results, variants)
-        if save_dir:
-            save_csv(results, self.NAME, save_dir)
-        if do_plot:
-            plot_results(results, self.NAME, save_dir or "results")
+        # Print results grouped by half_dim so each Triton variant is compared
+        # against the PyTorch baseline that did the same amount of work.
+        for half_dim in half_dims:
+            pt_key = f"pytorch_hd{half_dim}"
+            group_variants = [f"template_hd{half_dim}", f"example_hd{half_dim}", pt_key]
+            group_variants = [v for v in group_variants
+                              if any(v in results[sl] for sl in seq_lens if sl in results)]
+            if not group_variants:
+                continue
+            print_results(
+                f"RoPE Benchmark  hd={half_dim}  ({device})",
+                results, group_variants, pytorch_key=pt_key,
+            )
+            if save_dir:
+                save_csv(results, f"{self.NAME}_hd{half_dim}", save_dir)
+            if do_plot:
+                plot_results(results, f"{self.NAME}_hd{half_dim}",
+                             save_dir or "results", pytorch_key=pt_key)
         return results
 
 
@@ -1215,8 +1225,10 @@ def benchmark_model(audio_path: str, warmup: int = 2, runs: int = 5,
             else:
                 feats = processor(audio, sampling_rate=16000, return_tensors="pt", padding="max_length")
                 input_features = feats["input_features"].to(device=device, dtype=torch.float32)
+                mel_frames = input_features.shape[-1]
+                num_audio_tokens = max(1, mel_frames // 2 // 4)
                 input_ids = torch.tensor(
-                    [[59253, 10, 59261] + [59260] * 100 + [59262, 59253, 10, 9249, 70891, 419, 7122, 1119, 1467, 59254, 10]],
+                    [[59253, 10, 59261] + [59260] * num_audio_tokens + [59262, 59253, 10, 9249, 70891, 419, 7122, 1119, 1467, 59254, 10]],
                     dtype=torch.int64, device=device,
                 )
                 input_features_mask = None
