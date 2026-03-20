@@ -316,7 +316,7 @@ def scaled_dot_product_attention(
 
     use_triton = (
         q.is_cuda
-        and seq_k_padded <= MAX_ATTENTION_DIM
+        and (seq_q == 1 or seq_k_padded <= MAX_ATTENTION_DIM)
         and head_dim_padded <= MAX_ATTENTION_DIM
     )
 

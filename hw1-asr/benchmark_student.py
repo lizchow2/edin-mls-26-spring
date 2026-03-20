@@ -19,6 +19,7 @@ import importlib
 
 # Expected transcription for the test audio
 EXPECTED_TEXT = "CONCORD RETURNED TO ITS PLACE AMIDST THE TENTS"
+# EXPECTED_TEXT = "This is not a self help book. Nobody needs another sermon about the ten steps or seven stages or sixteen hours a week that will deliver them from their stalled or fucked up life. Hit the local bookstore or surf Amazon and you will slip into a bottomless pit of self help hype. Must feel good to consume because it sure does sell. Too bad most of it won't work. Not for real. Not forever. You might see progress here and there"
 
 def download_librispeech_sample():
     """Download a LibriSpeech sample audio file."""

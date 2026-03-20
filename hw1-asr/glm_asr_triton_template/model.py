@@ -17,7 +17,6 @@ from rope import RotaryEmbedding, apply_rotary_pos_emb
 from flash import scaled_dot_product_attention, MultiHeadAttention
 from conv import Conv1d, Conv1dSubsampler
 
-
 # ============================================================================
 # Configuration
 # ============================================================================
@@ -536,6 +535,7 @@ class TextDecoder:
         batch_size: int,
         max_seq_len: int,
         dtype=torch.float32,
+        device=None
     ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
         """Allocate KV buffers for all layers.
 
@@ -544,6 +544,10 @@ class TextDecoder:
         """
         head_dim = self.config.text_hidden_size // self.config.text_num_heads
         num_kv_heads = self.config.text_num_kv_heads
+
+        if device is None:
+            w = getattr(self.embed_tokens, "weight", None)
+            device = w.device if w is not None else torch.device("cpu")
 
         kv_buffers = []
         device = getattr(self.embed_tokens, "weight", None)
@@ -629,7 +633,7 @@ class MultiModalProjector:
 class GlmAsrModel:
     """GLM-ASR model using Torch + Triton kernels."""
 
-    def __init__(self, config: GlmAsrConfig):
+    def __init__(self, config: GlmAsrConfig, is_draft: bool = False):
         self.config = config
 
         # Components
@@ -729,7 +733,7 @@ class GlmAsrModel:
         max_new_tokens: int = 256,
         temperature: float = 1.0,
         top_k: int = 50,
-        audio_pad_token_id: int = 59260  # <|pad|> token for audio
+        audio_pad_token_id: int = 59260,  # <|pad|> token for audio
     ) -> torch.Tensor:
         """Generate tokens from audio with proper chat template format.
 
@@ -814,11 +818,27 @@ class GlmAsrModel:
         eos_token_ids_cp = torch.tensor(
             eos_token_ids, dtype=torch.int64, device=generated.device
         )
-
+        
+        past_key_values = None
         # Autoregressive generation
         for _ in range(max_new_tokens):
             # Get logits for next token
-            logits = self.decode(inputs_embeds=inputs_embeds)
+            # logits = self.decode(inputs_embeds=inputs_embeds)
+            if past_key_values is None:
+                # prefill — process full sequence
+                logits, past_key_values = self.decode(
+                    inputs_embeds=inputs_embeds,
+                    use_cache=True
+                )
+            else:
+                # decode — process only new token
+                new_embeds = self.text_decoder.embed_tokens(next_token)
+                logits, past_key_values = self.decode(
+                    inputs_embeds=new_embeds,
+                    use_cache=True,
+                    past_key_values=past_key_values
+                )
+            
             next_token_logits = logits[:, -1, :] / temperature
 
             # Top-k sampling
@@ -859,8 +879,7 @@ class GlmAsrModel:
             if torch.all(finished):
                 break
 
-            # Update inputs_embeds with new token
-            new_embeds = self.text_decoder.embed_tokens(next_token)
-            inputs_embeds = torch.cat([inputs_embeds, new_embeds], dim=1)
-
+            # # Update inputs_embeds with new token
+            # new_embeds = self.text_decoder.embed_tokens(next_token)
+            # inputs_embeds = torch.cat([inputs_embeds, new_embeds], dim=1)
         return generated
