@@ -342,12 +342,9 @@ class DecoderLayer:
 
         # Self-attention with pre-norm
         residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
 
-        # Project to Q, K, V
-        q = self.q_proj(hidden_states)
-        k = self.k_proj(hidden_states)
-        v = self.v_proj(hidden_states)
+        # Project to Q, K, V (fused RMSNorm + QKV projection)
+        q, k, v = self.fused_qkv(hidden_states)
 
         # Reshape for attention
         q = q.reshape(batch, seq_len, self.num_heads, self.head_dim).permute(0, 2, 1, 3)

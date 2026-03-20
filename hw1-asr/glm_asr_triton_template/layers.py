@@ -854,11 +854,16 @@ class FusedRMSNormQKV:
     def __call__(self, x: torch.Tensor):
         M = int(np.prod(x.shape[:-1]))
         K = self.hidden_size
-        
+
+        if self.norm_weight.device != x.device:
+            self.norm_weight = self.norm_weight.to(x.device)
+        if self.qkv_weight.device != x.device:
+            self.qkv_weight = self.qkv_weight.to(x.device)
+
         q = torch.empty((M, self.q_out), device=x.device, dtype=x.dtype)
         k = torch.empty((M, self.kv_out), device=x.device, dtype=x.dtype)
         v = torch.empty((M, self.kv_out), device=x.device, dtype=x.dtype)
-        
+
         grid = lambda META: (
             triton.cdiv(M, META['BLOCK_M']),
             triton.cdiv(self.total_out, META['BLOCK_N'])
