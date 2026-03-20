@@ -26,3 +26,5 @@ Thumbs.db
 requirements.lock
 *.local*
 *.png
+
+triton-tutorial/
