@@ -167,18 +167,38 @@ def print_results(title: str,
     seq_lens = sorted(results.keys())
     header = ["seq_len"] + variants
 
-    # --- Latency ---
+    # --- Latency (mean ± std) ---
     lat_rows = []
     for sl in seq_lens:
         row = [str(sl)]
         for v in variants:
             r = results[sl].get(v)
-            ms = r.mean_ms if r else NA
+            ms  = r.mean_ms if r else NA
+            std = r.std_ms  if r else NA
             tag = "*" if (not math.isnan(ms) and v != pytorch_key
                           and _is_best(ms, sl, results, variants, pytorch_key)) else " "
-            row.append(_fmt(ms) + "ms" + tag)
+            if math.isnan(ms):
+                row.append(" N/A ")
+            else:
+                std_str = f"±{_fmt(std)}" if not math.isnan(std) else ""
+                row.append(f"{_fmt(ms)}{std_str}ms{tag}")
         lat_rows.append(row)
-    display_table("Latency (ms) — lower is better  (* = best Triton variant)", header, lat_rows)
+    display_table("Latency mean±std (ms) — lower is better  (* = best Triton variant)", header, lat_rows)
+
+    # --- Min / Max ---
+    mm_rows = []
+    for sl in seq_lens:
+        row = [str(sl)]
+        for v in variants:
+            r = results[sl].get(v)
+            lo = r.min_ms if r else NA
+            hi = r.max_ms if r else NA
+            if math.isnan(lo):
+                row.append(" N/A ")
+            else:
+                row.append(f"{_fmt(lo)}–{_fmt(hi)}ms")
+        mm_rows.append(row)
+    display_table("Latency min–max (ms)", header, mm_rows)
 
     # --- Speedup vs PyTorch ---
     spd_rows = []
@@ -198,6 +218,24 @@ def print_results(title: str,
                 row.append(f"{pt_ms / ms:6.2f}x")
         spd_rows.append(row)
     display_table("Speedup vs PyTorch  (>1.0 = faster than PyTorch)", header, spd_rows)
+
+    # --- Bandwidth ---
+    bw_rows = []
+    for sl in seq_lens:
+        row = [str(sl)]
+        has_bw = any(
+            (results[sl].get(v) and not math.isnan(results[sl][v].bw_gb))
+            for v in variants
+        )
+        if not has_bw:
+            break
+        for v in variants:
+            r = results[sl].get(v)
+            bw = r.bw_gb if r else NA
+            row.append(_fmt(bw, 2) + " GB/s" if not math.isnan(bw) else " N/A ")
+        bw_rows.append(row)
+    if bw_rows:
+        display_table("Memory Bandwidth GB/s  (higher is better)", header, bw_rows)
 
     # --- TFLOPS ---
     tflops_rows = []
@@ -330,7 +368,16 @@ class AttentionBench:
         tmpl_flash = _load_module("flash", _TEMPLATE_DIR)
         exmp_attn  = _load_module("attention", _EXAMPLE_DIR)
 
-        shm_budget = 49152  # 48 KB
+        # Shared memory per block by compute capability (bytes).
+        # Triton opts into the larger carve-out automatically.
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(0)
+            cc = props.major * 10 + props.minor
+            _SHM = {90: 228*1024, 89: 100*1024, 87: 100*1024,
+                    86: 100*1024, 80: 164*1024, 75: 64*1024, 70: 96*1024}
+            shm_budget = _SHM.get(cc, 48*1024)
+        else:
+            shm_budget = 48*1024
 
         for sl in seq_lens:
             results[sl] = {}
@@ -1097,7 +1144,7 @@ class RoPEBench:
                 try:
                     def _run_pt(positions=positions, inv_freq=inv_freq):
                         freqs = positions[:, None] * inv_freq[None, :]
-                        torch.cos(freqs); torch.sin(freqs)
+                        cos_vals = torch.cos(freqs); sin_vals = torch.sin(freqs)  # noqa: F841
                     times = timed_run(_run_pt, warmup=warmup, runs=runs)
                     mean  = np.mean(times)
                     results[sl][pt_label] = BenchResult(
@@ -1126,6 +1173,400 @@ class RoPEBench:
             if do_plot:
                 plot_results(results, f"{self.NAME}_hd{half_dim}",
                              save_dir or "results", pytorch_key=pt_key)
+        return results
+
+
+# ---------------------------------------------------------------------------
+# FusedRMSNorm Benchmark
+# (template fused_residual_rmsnorm_kernel vs unfused baseline vs PyTorch)
+# ---------------------------------------------------------------------------
+
+class FusedRMSNormBench:
+    NAME = "fused_rmsnorm"
+    DEFAULT_SEQ_LENS   = [128, 256, 512, 1024, 2048]
+    DEFAULT_BLOCK_SIZES = [256, 512, 1024, 1280, 2048, 3584]
+
+    def run(self, seq_lens, block_sizes, runs, warmup,
+            save_dir=None, do_plot=False):
+        device = _device()
+        hidden_sizes = block_sizes if block_sizes else self.DEFAULT_BLOCK_SIZES
+        results: Dict[int, Dict[str, BenchResult]] = {}
+
+        tmpl_layers = _load_module("layers", _TEMPLATE_DIR)
+        exmp_layers = _load_module("layers", _EXAMPLE_DIR)
+
+        for hidden in hidden_sizes:
+            key = hidden
+            results[key] = {}
+            batch_rows = 256
+            BS = next_power_of_two(hidden)
+
+            x   = torch.randn(batch_rows, hidden, device=device, dtype=torch.float32)
+            res = torch.randn(batch_rows, hidden, device=device, dtype=torch.float32)
+            w   = torch.ones(hidden, device=device, dtype=torch.float32)
+            eps = 1e-6
+
+            # Template — fused residual + rmsnorm in one kernel
+            if tmpl_layers is not None:
+                label = "template_fused"
+                try:
+                    x_buf      = x.clone()
+                    norm_out   = torch.empty_like(x)
+                    def _run_tmpl(x_buf=x_buf, res=res, w=w, norm_out=norm_out):
+                        tmpl_layers.fused_residual_rmsnorm_kernel[(batch_rows,)](
+                            x_buf, res, w, norm_out,
+                            x_buf.stride(0),
+                            hidden, eps,
+                            BLOCK_SIZE=BS,
+                        )
+                    times = timed_run(_run_tmpl, warmup=warmup, runs=runs)
+                    # reads x + res, writes x (residual) + norm_out
+                    bw   = 4 * batch_rows * hidden * 4
+                    mean = np.mean(times)
+                    flops = 6 * batch_rows * hidden  # add + sq + sum + rsqrt + mul + mul
+                    results[key][label] = BenchResult(
+                        self.NAME, label, key, f"H={hidden}",
+                        mean, np.std(times), np.min(times), np.max(times),
+                        bw / (mean / 1000) / 1e9, flops / (mean / 1000) / 1e12,
+                    )
+                except Exception as e:
+                    print(f"    [template_fused rmsnorm, H={hidden}] skipped: {e}")
+
+            # Example — unfused: manual residual add then rmsnorm_kernel
+            if exmp_layers is not None:
+                label = "example_unfused"
+                try:
+                    y = torch.empty_like(x)
+                    def _run_exmp(x=x, res=res, w=w, y=y):
+                        xr = x + res
+                        exmp_layers.rmsnorm_kernel[(batch_rows,)](
+                            xr, w, y,
+                            xr.stride(0), y.stride(0),
+                            hidden, eps, BLOCK_SIZE=BS,
+                        )
+                    times = timed_run(_run_exmp, warmup=warmup, runs=runs)
+                    mean = np.mean(times)
+                    bw   = 4 * batch_rows * hidden * 4
+                    results[key][label] = BenchResult(
+                        self.NAME, label, key, f"H={hidden}",
+                        mean, np.std(times), np.min(times), np.max(times),
+                        bw / (mean / 1000) / 1e9, NA,
+                    )
+                except Exception as e:
+                    print(f"    [example_unfused rmsnorm, H={hidden}] skipped: {e}")
+
+            # PyTorch
+            label = "pytorch"
+            try:
+                def _run_pt(x=x, res=res, w=w):
+                    torch.nn.functional.rms_norm(x + res, (hidden,), w, eps)
+                times = timed_run(_run_pt, warmup=warmup, runs=runs)
+                mean = np.mean(times)
+                bw   = 4 * batch_rows * hidden * 4
+                results[key][label] = BenchResult(
+                    self.NAME, label, key, f"H={hidden}",
+                    mean, np.std(times), np.min(times), np.max(times),
+                    bw / (mean / 1000) / 1e9, NA,
+                )
+            except Exception as e:
+                print(f"    [pytorch fused_rmsnorm, H={hidden}] skipped: {e}")
+
+        variants = ["template_fused", "example_unfused", "pytorch"]
+        variants = [v for v in variants if any(v in results[k] for k in results)]
+        print_results(
+            f"FusedRMSNorm Benchmark  (batch_rows=256, sweep hidden_size, {device})",
+            results, variants,
+        )
+        if save_dir:
+            save_csv(results, self.NAME, save_dir)
+        if do_plot:
+            plot_results(results, self.NAME, save_dir or "results")
+        return results
+
+
+# ---------------------------------------------------------------------------
+# FusedQKV Benchmark
+# (template fused rmsnorm+QKV projection vs example unfused vs PyTorch)
+# ---------------------------------------------------------------------------
+
+class FusedQKVBench:
+    NAME = "fused_qkv"
+    DEFAULT_SEQ_LENS    = [64, 128, 256, 512, 1024]
+    DEFAULT_BLOCK_SIZES = [16, 32, 64]   # BLOCK_M = BLOCK_N (output tile); BLOCK_K fixed at 64
+    _BLOCK_K = 64  # K-reduction tile — independent of M/N sweep, matches autotune configs
+
+    # Fixed dims from GLM-ASR text decoder config
+    _K    = 3584   # hidden size
+    _N_Q  = 3584   # query dim
+    _N_KV = 512    # key/value dim (GQA)
+
+    def run(self, seq_lens, block_sizes, runs, warmup,
+            save_dir=None, do_plot=False):
+        import triton
+
+        device = _device()
+        tile_sizes = block_sizes if block_sizes else self.DEFAULT_BLOCK_SIZES
+        results: Dict[int, Dict[str, BenchResult]] = {}
+
+        tmpl_layers = _load_module("layers", _TEMPLATE_DIR)
+        exmp_layers = _load_module("layers", _EXAMPLE_DIR)
+
+        K    = self._K
+        N_Q  = self._N_Q
+        N_KV = self._N_KV
+        BK   = self._BLOCK_K
+        total_n = N_Q + 2 * N_KV
+        eps = 1e-6
+
+        def _pad_to(n, m): return ((n + m - 1) // m) * m
+
+        for sl in seq_lens:
+            results[sl] = {}
+            M = sl
+
+            x       = torch.randn(M, K, device=device, dtype=torch.float32)
+            w_norm  = torch.ones(K, device=device, dtype=torch.float32)
+            w_qkv   = torch.randn(K, total_n, device=device, dtype=torch.float32)
+            BS_norm = next_power_of_two(K)
+
+            # Template — fused rmsnorm + QKV in one kernel, sweep BLOCK_M/BLOCK_N tile sizes
+            # BLOCK_K is fixed independently so the K-reduction tile is always valid for tl.dot
+            if tmpl_layers is not None:
+                kernel = tmpl_layers.final_fused_qkv_kernel
+                for T in tile_sizes:
+                    M_p = _pad_to(M, T)
+                    N_p = _pad_to(total_n, T)
+                    grid = (triton.cdiv(M_p, T), triton.cdiv(N_p, T))
+                    q_out = torch.empty(M, N_Q,  device=device, dtype=torch.float32)
+                    k_out = torch.empty(M, N_KV, device=device, dtype=torch.float32)
+                    v_out = torch.empty(M, N_KV, device=device, dtype=torch.float32)
+                    label = f"template_BM{T}_BN{T}"
+                    try:
+                        def _run_tmpl(kernel=kernel, x=x, w_norm=w_norm, w_qkv=w_qkv,
+                                      q_out=q_out, k_out=k_out, v_out=v_out,
+                                      M=M, K=K, N_Q=N_Q, N_KV=N_KV,
+                                      T=T, BK=BK, eps=eps, grid=grid):
+                            kernel[grid](
+                                x, w_norm, w_qkv,
+                                q_out, k_out, v_out,
+                                x.stride(0), x.stride(1),
+                                w_qkv.stride(0), w_qkv.stride(1),
+                                M, K, N_Q, N_KV, eps,
+                                BLOCK_M=T, BLOCK_N=T, BLOCK_K=BK,
+                            )
+                        times = timed_run(_run_tmpl, warmup=warmup, runs=runs)
+                        flops = 2 * M * K * total_n + M * K  # matmul + rms
+                        mean  = np.mean(times)
+                        results[sl][label] = BenchResult(
+                            self.NAME, label, sl, f"BM={T}/BN={T}/BK={BK}",
+                            mean, np.std(times), np.min(times), np.max(times),
+                            NA, flops / (mean / 1000) / 1e12,
+                        )
+                    except Exception as e:
+                        print(f"    [template fused_qkv BM={T}/BN={T}/BK={BK}, seq={sl}] skipped: {type(e).__name__}: {e}")
+
+            # Example — unfused: rmsnorm then linear x3
+            if exmp_layers is not None:
+                label = "example_unfused"
+                try:
+                    w_q  = w_qkv[:, :N_Q].contiguous()
+                    w_k  = w_qkv[:, N_Q:N_Q + N_KV].contiguous()
+                    w_v  = w_qkv[:, N_Q + N_KV:].contiguous()
+                    xn   = torch.empty_like(x)
+                    def _run_exmp(x=x, w_norm=w_norm, xn=xn, w_q=w_q, w_k=w_k, w_v=w_v):
+                        exmp_layers.rmsnorm_kernel[(M,)](
+                            x, w_norm, xn,
+                            x.stride(0), xn.stride(0),
+                            K, eps, BLOCK_SIZE=BS_norm,
+                        )
+                        xn @ w_q
+                        xn @ w_k
+                        xn @ w_v
+                    times = timed_run(_run_exmp, warmup=warmup, runs=runs)
+                    flops = 2 * M * K * total_n + M * K
+                    mean  = np.mean(times)
+                    results[sl][label] = BenchResult(
+                        self.NAME, label, sl, "unfused",
+                        mean, np.std(times), np.min(times), np.max(times),
+                        NA, flops / (mean / 1000) / 1e12,
+                    )
+                except Exception as e:
+                    print(f"    [example unfused_qkv, seq={sl}] skipped: {e}")
+
+            # PyTorch
+            label = "pytorch"
+            try:
+                w_q  = w_qkv[:, :N_Q].t().contiguous()
+                w_k  = w_qkv[:, N_Q:N_Q + N_KV].t().contiguous()
+                w_v  = w_qkv[:, N_Q + N_KV:].t().contiguous()
+                def _run_pt(x=x, w_norm=w_norm, w_q=w_q, w_k=w_k, w_v=w_v):
+                    xn = torch.nn.functional.rms_norm(x, (K,), w_norm, eps)
+                    torch.nn.functional.linear(xn, w_q)
+                    torch.nn.functional.linear(xn, w_k)
+                    torch.nn.functional.linear(xn, w_v)
+                times = timed_run(_run_pt, warmup=warmup, runs=runs)
+                flops = 2 * M * K * total_n + M * K
+                mean  = np.mean(times)
+                results[sl][label] = BenchResult(
+                    self.NAME, label, sl, "n/a",
+                    mean, np.std(times), np.min(times), np.max(times),
+                    NA, flops / (mean / 1000) / 1e12,
+                )
+            except Exception as e:
+                print(f"    [pytorch fused_qkv, seq={sl}] skipped: {e}")
+
+        variants = ([f"template_BM{T}_BN{T}" for T in tile_sizes]
+                    + ["example_unfused", "pytorch"])
+        variants = [v for v in variants if any(v in results[sl] for sl in seq_lens)]
+        print_results(
+            f"FusedQKV Benchmark  (M=seq_len, K={K}, N_Q={N_Q}, N_KV={N_KV}, BK={BK}, {device})",
+            results, variants,
+        )
+        if save_dir:
+            save_csv(results, self.NAME, save_dir)
+        if do_plot:
+            plot_results(results, self.NAME, save_dir or "results")
+        return results
+
+
+# ---------------------------------------------------------------------------
+# LinearGELU Benchmark
+# (template fused linear+GELU vs example unfused vs PyTorch)
+# ---------------------------------------------------------------------------
+
+class LinearGELUBench:
+    NAME = "linear_gelu"
+    DEFAULT_SEQ_LENS    = [64, 128, 256, 512, 1024]
+    DEFAULT_BLOCK_SIZES = [32, 64, 128]
+
+    def run(self, seq_lens, block_sizes, runs, warmup,
+            hidden_size=2048, out_size=5632,
+            save_dir=None, do_plot=False):
+        import triton
+
+        device = _device()
+        tile_sizes = block_sizes if block_sizes else self.DEFAULT_BLOCK_SIZES
+        results: Dict[int, Dict[str, BenchResult]] = {}
+
+        tmpl_layers = _load_module("layers", _TEMPLATE_DIR)
+        exmp_layers = _load_module("layers", _EXAMPLE_DIR)
+
+        def _pad_to(n, m): return ((n + m - 1) // m) * m
+
+        for sl in seq_lens:
+            results[sl] = {}
+            M, K, N = sl, hidden_size, out_size
+
+            x  = torch.randn(M, K, device=device, dtype=torch.float32)
+            wt = torch.randn(K, N, device=device, dtype=torch.float32)
+
+            # Template — fused linear+GELU kernel, sweep tile sizes
+            if tmpl_layers is not None:
+                kernel = tmpl_layers.linear_gelu_kernel
+                for T in tile_sizes:
+                    TK = max(T // 2, 16)
+                    M_p = _pad_to(M, T); K_p = _pad_to(K, TK); N_p = _pad_to(N, T)
+                    x_p = torch.zeros(M_p, K_p, device=device, dtype=torch.float32)
+                    x_p[:M, :K] = x
+                    w_p = torch.zeros(K_p, N_p, device=device, dtype=torch.float32)
+                    w_p[:K, :N] = wt
+                    o_p = torch.zeros(M_p, N_p, device=device, dtype=torch.float32)
+                    grid = (triton.cdiv(M_p, T), triton.cdiv(N_p, T))
+                    label = f"template_T{T}"
+                    try:
+                        def _run_tmpl(kernel=kernel, x_p=x_p, w_p=w_p, o_p=o_p,
+                                      M_p=M_p, N_p=N_p, K_p=K_p, T=T, TK=TK, grid=grid):
+                            kernel[grid](
+                                x_p, w_p, o_p,
+                                M_p, N_p, K_p,
+                                x_p.stride(0), x_p.stride(1),
+                                w_p.stride(0), w_p.stride(1),
+                                o_p.stride(0), o_p.stride(1),
+                                BLOCK_M=T, BLOCK_N=T, BLOCK_K=TK,
+                            )
+                        times = timed_run(_run_tmpl, warmup=warmup, runs=runs)
+                        flops = 2 * M * K * N + M * N  # matmul + gelu
+                        mean  = np.mean(times)
+                        results[sl][label] = BenchResult(
+                            self.NAME, label, sl, f"T={T}",
+                            mean, np.std(times), np.min(times), np.max(times),
+                            (M * K + K * N + M * N) * 4 / (mean / 1000) / 1e9,
+                            flops / (mean / 1000) / 1e12,
+                        )
+                    except Exception as e:
+                        print(f"    [template linear_gelu T={T}, seq={sl}] skipped: {type(e).__name__}")
+
+            # Example — unfused: linear_kernel_tf32 then gelu_kernel
+            if exmp_layers is not None:
+                label = "example_unfused"
+                try:
+                    for T in tile_sizes[:1]:  # use first tile size for unfused example
+                        TK = max(T // 2, 16)
+                        M_p = _pad_to(M, T); K_p = _pad_to(K, TK); N_p = _pad_to(N, T)
+                        x_p = torch.zeros(M_p, K_p, device=device, dtype=torch.float32)
+                        x_p[:M, :K] = x
+                        w_p = torch.zeros(K_p, N_p, device=device, dtype=torch.float32)
+                        w_p[:K, :N] = wt
+                        o_p = torch.zeros(M_p, N_p, device=device, dtype=torch.float32)
+                        grid_lin = (triton.cdiv(M_p, T), triton.cdiv(N_p, T))
+                        total_elems = M_p * N_p
+                        BS_gelu = next_power_of_two(min(total_elems, 1024))
+                        grid_gelu = (triton.cdiv(total_elems, BS_gelu),)
+                        def _run_exmp(x_p=x_p, w_p=w_p, o_p=o_p,
+                                      M_p=M_p, N_p=N_p, K_p=K_p, T=T, TK=TK,
+                                      grid_lin=grid_lin, grid_gelu=grid_gelu,
+                                      total_elems=total_elems, BS_gelu=BS_gelu):
+                            exmp_layers.linear_kernel_tf32[grid_lin](
+                                x_p, w_p, o_p,
+                                M_p, N_p, K_p,
+                                x_p.stride(0), x_p.stride(1),
+                                w_p.stride(0), w_p.stride(1),
+                                o_p.stride(0), o_p.stride(1),
+                                BLOCK_M=T, BLOCK_N=T, BLOCK_K=TK,
+                            )
+                            exmp_layers.gelu_kernel[grid_gelu](
+                                o_p, o_p, total_elems, BLOCK_SIZE=BS_gelu,
+                            )
+                    times = timed_run(_run_exmp, warmup=warmup, runs=runs)
+                    flops = 2 * M * K * N + M * N
+                    mean  = np.mean(times)
+                    results[sl][label] = BenchResult(
+                        self.NAME, label, sl, "unfused",
+                        mean, np.std(times), np.min(times), np.max(times),
+                        (M * K + K * N + M * N) * 4 / (mean / 1000) / 1e9,
+                        flops / (mean / 1000) / 1e12,
+                    )
+                except Exception as e:
+                    print(f"    [example linear_gelu, seq={sl}] skipped: {type(e).__name__}: {e}")
+
+            # PyTorch
+            label = "pytorch"
+            try:
+                def _run_pt(x=x, wt=wt):
+                    torch.nn.functional.gelu(torch.nn.functional.linear(x, wt.t()))
+                times = timed_run(_run_pt, warmup=warmup, runs=runs)
+                flops = 2 * M * K * N + M * N
+                mean  = np.mean(times)
+                results[sl][label] = BenchResult(
+                    self.NAME, label, sl, "n/a",
+                    mean, np.std(times), np.min(times), np.max(times),
+                    (M * K + K * N + M * N) * 4 / (mean / 1000) / 1e9,
+                    flops / (mean / 1000) / 1e12,
+                )
+            except Exception as e:
+                print(f"    [pytorch linear_gelu, seq={sl}] skipped: {e}")
+
+        variants = ([f"template_T{T}" for T in tile_sizes]
+                    + ["example_unfused", "pytorch"])
+        variants = [v for v in variants if any(v in results[sl] for sl in seq_lens)]
+        print_results(
+            f"LinearGELU Benchmark  (M=seq_len, K={hidden_size}, N={out_size}, {device})",
+            results, variants,
+        )
+        if save_dir:
+            save_csv(results, self.NAME, save_dir)
+        if do_plot:
+            plot_results(results, self.NAME, save_dir or "results")
         return results
 
 
@@ -1178,6 +1619,71 @@ def _load_audio(path: str) -> np.ndarray:
         return arr.astype(np.float32)
 
 
+def _decode_transcription(processor, output):
+    """Best-effort transcription decode."""
+    try:
+        if hasattr(processor, "decode"):
+            return processor.decode(output[0].tolist(), skip_special_tokens=True)
+        elif hasattr(processor, "tokenizer"):
+            return processor.tokenizer.decode(output[0].tolist(), skip_special_tokens=True)
+    except Exception:
+        pass
+    return ""
+
+
+def _profile_component_timings(call_fn) -> Dict[str, float]:
+    """Run call_fn under torch.profiler and return per-module CUDA time (ms)."""
+    try:
+        import torch.profiler as tp
+        activities = [tp.ProfilerActivity.CPU]
+        if torch.cuda.is_available():
+            activities.append(tp.ProfilerActivity.CUDA)
+        with tp.profile(activities=activities, with_modules=True,
+                        record_shapes=False) as prof:
+            call_fn()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        timings: Dict[str, float] = {}
+        for evt in prof.key_averages(group_by_input_shape=False):
+            name = evt.key
+            cuda_ms = (evt.self_cuda_time_total / 1000.0
+                       if torch.cuda.is_available() else evt.self_cpu_time_total / 1000.0)
+            if cuda_ms > 0.01:
+                timings[name] = timings.get(name, 0.0) + cuda_ms
+        return timings
+    except Exception as e:
+        print(f"    [profiler] skipped: {e}")
+        return {}
+
+
+def _aggregate_component_timings(timings: Dict[str, float]) -> Dict[str, float]:
+    """Group raw profiler keys into high-level model components."""
+    groups = {
+        "conv_subsampler": [],
+        "audio_encoder":   [],
+        "projector":       [],
+        "text_decoder":    [],
+        "embedding":       [],
+        "other":           [],
+    }
+    for key, ms in timings.items():
+        kl = key.lower()
+        if any(x in kl for x in ["conv1d", "im2col", "conv_sub"]):
+            groups["conv_subsampler"].append(ms)
+        elif any(x in kl for x in ["audio", "encoder"]):
+            groups["audio_encoder"].append(ms)
+        elif "project" in kl:
+            groups["projector"].append(ms)
+        elif any(x in kl for x in ["decoder", "text", "generate", "lm_head", "embed_tokens"]):
+            groups["text_decoder"].append(ms)
+        elif "embed" in kl:
+            groups["embedding"].append(ms)
+        else:
+            groups["other"].append(ms)
+    return {k: sum(v) for k, v in groups.items() if v}
+
+
 def benchmark_model(audio_path: str, warmup: int = 2, runs: int = 5,
                     max_new_tokens: int = 50):
     """Load template and example models, benchmark generate() side by side."""
@@ -1204,10 +1710,9 @@ def benchmark_model(audio_path: str, warmup: int = 2, runs: int = 5,
         print(f"\n[{label}] Loading model from {os.path.basename(folder)}...")
         if folder not in sys.path:
             sys.path.insert(0, folder)
-        # Clear cached modules to ensure we import from the right folder
         for mod_name in list(sys.modules.keys()):
             if mod_name in ["weight_loader", "model", "layers", "attention",
-                            "flash", "rope", "conv", "attention"]:
+                            "flash", "rope", "conv"]:
                 del sys.modules[mod_name]
 
         try:
@@ -1254,25 +1759,41 @@ def benchmark_model(audio_path: str, warmup: int = 2, runs: int = 5,
             for _ in range(warmup):
                 output = _call()
 
+            # Reset peak memory counter after warmup
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats()
+
             print(f"  Timing ({runs} runs)...")
             times = timed_run(_call, warmup=0, runs=runs)
 
-            # Decode transcription
-            transcription = ""
-            try:
-                if hasattr(processor, "decode"):
-                    transcription = processor.decode(output[0].tolist(), skip_special_tokens=True)
-                elif hasattr(processor, "tokenizer"):
-                    transcription = processor.tokenizer.decode(output[0].tolist(), skip_special_tokens=True)
-            except Exception:
-                pass
+            peak_mem_mb = (torch.cuda.max_memory_allocated() / 1024**2
+                           if torch.cuda.is_available() else float("nan"))
+
+            transcription = _decode_transcription(processor, output)
+
+            # Count generated tokens
+            n_generated = output.shape[-1] - input_ids.shape[-1] if hasattr(output, "shape") else max_new_tokens
+            mean_ms = np.mean(times)
+            tok_per_sec = n_generated / (mean_ms / 1000.0) if mean_ms > 0 else float("nan")
+
+            # Per-component profiler pass (one call, not in timing loop)
+            print(f"  Profiling components...")
+            component_timings = _profile_component_timings(_call)
+            component_groups  = _aggregate_component_timings(component_timings)
 
             results[label] = {
-                "mean": np.mean(times), "std": np.std(times),
-                "min": np.min(times),   "max": np.max(times),
+                "mean": mean_ms,       "std": np.std(times),
+                "min":  np.min(times), "max": np.max(times),
+                "tok_per_sec": tok_per_sec,
+                "peak_mem_mb": peak_mem_mb,
+                "n_generated": n_generated,
                 "transcription": transcription,
+                "components": component_groups,
             }
-            print(f"  Mean: {np.mean(times):.1f}ms ± {np.std(times):.1f}ms")
+            print(f"  Mean: {mean_ms:.1f}ms ± {np.std(times):.1f}ms  "
+                  f"[{np.min(times):.1f}–{np.max(times):.1f}ms]  "
+                  f"{tok_per_sec:.1f} tok/s")
+            print(f"  Peak GPU mem: {peak_mem_mb:.0f} MB")
             print(f"  Transcription: \"{transcription}\"")
 
         except Exception as e:
@@ -1281,7 +1802,6 @@ def benchmark_model(audio_path: str, warmup: int = 2, runs: int = 5,
         finally:
             if folder in sys.path:
                 sys.path.remove(folder)
-            # Free GPU memory
             try:
                 del model
                 if torch.cuda.is_available():
@@ -1297,22 +1817,62 @@ def benchmark_model(audio_path: str, warmup: int = 2, runs: int = 5,
     print("\n" + "=" * 72)
     print("SUMMARY")
     print("=" * 72)
-    if "template" in results and "example" in results:
-        t = results["template"]
-        e = results["example"]
-        speedup = e["mean"] / t["mean"] if t["mean"] > 0 else float("nan")
-        print(f"\n{'':26s} {'template':>12s}  {'example':>12s}  {'speedup':>10s}")
-        print("-" * 65)
-        print(f"{'Mean latency (ms)':<26s} {t['mean']:>12.1f}  {e['mean']:>12.1f}  {speedup:>9.2f}x")
-        print(f"{'Std (ms)':<26s} {t['std']:>12.1f}  {e['std']:>12.1f}")
-        print(f"{'Min (ms)':<26s} {t['min']:>12.1f}  {e['min']:>12.1f}")
-        print(f"{'Max (ms)':<26s} {t['max']:>12.1f}  {e['max']:>12.1f}")
-        print(f"\nTranscription (template): \"{t.get('transcription', '')}\"")
-        print(f"Transcription (example):  \"{e.get('transcription', '')}\"")
-    elif results:
-        for label, r in results.items():
-            print(f"\n{label}: mean={r['mean']:.1f}ms ± {r['std']:.1f}ms")
-            print(f"  Transcription: \"{r.get('transcription', '')}\"")
+
+    labels_present = [l for l in ["template", "example"] if l in results]
+    if not labels_present:
+        return
+
+    # Overall timing table
+    col_w = 14
+    hdr_lbl = "Metric"
+    print(f"\n{'':28s}" + "".join(f"{l:>{col_w}s}" for l in labels_present))
+    if len(labels_present) == 2:
+        print(f"{'':28s}{'speedup':>{col_w}s}")
+    print("-" * (28 + col_w * (len(labels_present) + (1 if len(labels_present) == 2 else 0))))
+
+    def _row(name, key, fmt=".1f", suffix=""):
+        vals = [results[l].get(key, float("nan")) for l in labels_present]
+        row = f"{name:<28s}" + "".join(f"{v:{col_w}{fmt}}{suffix}" if not math.isnan(v) else f"{'N/A':>{col_w}s}" for v in vals)
+        if len(labels_present) == 2 and not any(math.isnan(v) for v in vals) and vals[0] > 0:
+            spd = vals[1] / vals[0]  # example / template (>1 means template faster)
+            row += f"{spd:{col_w}.2f}x"
+        print(row)
+
+    _row("Mean latency (ms)",   "mean",        ".1f")
+    _row("Std (ms)",            "std",         ".1f")
+    _row("Min (ms)",            "min",         ".1f")
+    _row("Max (ms)",            "max",         ".1f")
+    _row("Throughput (tok/s)",  "tok_per_sec", ".1f")
+    _row("Peak GPU mem (MB)",   "peak_mem_mb", ".0f")
+    _row("Tokens generated",    "n_generated", ".0f")
+
+    # Per-component breakdown
+    all_components = sorted({c for l in labels_present for c in results[l].get("components", {})})
+    if all_components:
+        print(f"\n{'─'*72}")
+        print("Per-Component CUDA Time (ms) — single profiled pass")
+        print(f"{'─'*72}")
+        print(f"{'Component':<24s}" + "".join(f"{l:>{col_w}s}" for l in labels_present)
+              + (f"{'speedup':>{col_w}s}" if len(labels_present) == 2 else ""))
+        print("-" * (24 + col_w * (len(labels_present) + (1 if len(labels_present) == 2 else 0))))
+        for comp in all_components:
+            vals = [results[l].get("components", {}).get(comp, float("nan")) for l in labels_present]
+            row = f"{comp:<24s}" + "".join(f"{v:{col_w}.2f}" if not math.isnan(v) else f"{'N/A':>{col_w}s}" for v in vals)
+            if len(labels_present) == 2 and not any(math.isnan(v) for v in vals) and vals[0] > 0:
+                row += f"{vals[1] / vals[0]:{col_w}.2f}x"
+            print(row)
+
+    # Transcriptions
+    print(f"\n{'─'*72}")
+    for l in labels_present:
+        print(f"Transcription ({l}): \"{results[l].get('transcription', '')}\"")
+
+    # Single-model fallback
+    if len(labels_present) == 1:
+        l = labels_present[0]
+        r = results[l]
+        print(f"\n{l}: mean={r['mean']:.1f}ms ± {r['std']:.1f}ms  "
+              f"[{r['min']:.1f}–{r['max']:.1f}ms]  {r['tok_per_sec']:.1f} tok/s")
 
 
 # ---------------------------------------------------------------------------
@@ -1320,19 +1880,23 @@ def benchmark_model(audio_path: str, warmup: int = 2, runs: int = 5,
 # ---------------------------------------------------------------------------
 
 KERNEL_REGISTRY = {
-    "attention":   AttentionBench,
-    "flash_attention": AttentionBench,  # alias
-    "rmsnorm":     RMSNormBench,
-    "layernorm":   LayerNormBench,
-    "linear":      LinearBench,
-    "swiglu":      SwiGLUBench,
-    "softmax":     SoftmaxBench,
-    "conv1d":      Conv1dBench,
-    "rope":        RoPEBench,
+    "attention":       AttentionBench,
+    "flash_attention": AttentionBench,      # alias
+    "rmsnorm":         RMSNormBench,
+    "layernorm":       LayerNormBench,
+    "linear":          LinearBench,
+    "swiglu":          SwiGLUBench,
+    "softmax":         SoftmaxBench,
+    "conv1d":          Conv1dBench,
+    "rope":            RoPEBench,
+    "fused_rmsnorm":   FusedRMSNormBench,
+    "fused_qkv":       FusedQKVBench,
+    "linear_gelu":     LinearGELUBench,
 }
 
 ALL_KERNELS = ["attention", "rmsnorm", "layernorm", "linear",
-               "swiglu", "softmax", "conv1d", "rope"]
+               "swiglu", "softmax", "conv1d", "rope",
+               "fused_rmsnorm", "fused_qkv", "linear_gelu"]
 
 
 def main():

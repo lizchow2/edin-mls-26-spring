@@ -116,15 +116,6 @@ def fused_residual_rmsnorm_kernel(
     norm_out = (combined * rstd) * w
     tl.store(Norm_Out_ptr + row_idx * stride + cols, norm_out, mask=mask)
 
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 64}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_K': 128}, num_warps=8, num_stages=3),
-    ],
-    key=['M', 'K'], 
-)
 @triton.jit
 def final_fused_qkv_kernel(
     x_ptr, w_norm_ptr, w_qkv_ptr, 

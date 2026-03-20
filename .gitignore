@@ -11,7 +11,7 @@ __pycache__/
 .venv
 env/
 venv/
-
+results/
 # IDE
 .idea/
 .vscode/
