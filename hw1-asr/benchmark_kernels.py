@@ -711,7 +711,7 @@ class LinearBench:
                     w_p = torch.zeros(K_p, N_p, device=device, dtype=torch.float32)
                     w_p[:K, :N] = wt
                     o_p = torch.zeros(M_p, N_p, device=device, dtype=torch.float32)
-                    grid = (triton.cdiv(M_p, T), triton.cdiv(N_p, T))
+                    grid = (triton.cdiv(M_p, T) * triton.cdiv(N_p, T),)  # flat 1D grid
                     label = f"template_T{T}"
                     try:
                         def _run_tmpl(kernel=kernel, x_p=x_p, w_p=w_p, o_p=o_p,
@@ -723,6 +723,7 @@ class LinearBench:
                                 w_p.stride(0), w_p.stride(1),
                                 o_p.stride(0), o_p.stride(1),
                                 BLOCK_M=T, BLOCK_N=T, BLOCK_K=TK,
+                                GROUP_SIZE=8,
                             )
                         times = timed_run(_run_tmpl, warmup=warmup, runs=runs)
                         flops = 2 * M * K * N
@@ -830,7 +831,7 @@ class SwiGLUBench:
                     u_p = torch.zeros(K_p, N_p, device=device, dtype=torch.float32)
                     u_p[:K, :N] = up_w
                     o_p = torch.zeros(M_p, N_p, device=device, dtype=torch.float32)
-                    grid = (triton.cdiv(M_p, T), triton.cdiv(N_p, T))
+                    grid = (triton.cdiv(M_p, T) * triton.cdiv(N_p, T),)  # flat 1D grid
                     label = f"template_T{T}"
                     try:
                         def _run_fused(kernel=kernel, x_p=x_p, g_p=g_p, u_p=u_p, o_p=o_p,
@@ -843,6 +844,7 @@ class SwiGLUBench:
                                 u_p.stride(0), u_p.stride(1),
                                 o_p.stride(0), o_p.stride(1),
                                 BLOCK_M=T, BLOCK_N=T, BLOCK_K=TK,
+                                GROUP_SIZE=8,
                             )
                         times = timed_run(_run_fused, warmup=warmup, runs=runs)
                         flops = 2 * 2 * M * K * N + M * N  # gate+up matmuls + silu+mul
@@ -1461,6 +1463,7 @@ class LinearGELUBench:
             wt = torch.randn(K, N, device=device, dtype=torch.float32)
 
             # Template — fused linear+GELU kernel, sweep tile sizes
+            # Template uses a flat 1D grid with grouped PID ordering (GROUP_SIZE=8)
             if tmpl_layers is not None:
                 kernel = tmpl_layers.linear_gelu_kernel
                 for T in tile_sizes:
@@ -1471,7 +1474,7 @@ class LinearGELUBench:
                     w_p = torch.zeros(K_p, N_p, device=device, dtype=torch.float32)
                     w_p[:K, :N] = wt
                     o_p = torch.zeros(M_p, N_p, device=device, dtype=torch.float32)
-                    grid = (triton.cdiv(M_p, T), triton.cdiv(N_p, T))
+                    grid = (triton.cdiv(M_p, T) * triton.cdiv(N_p, T),)  # flat 1D grid
                     label = f"template_T{T}"
                     try:
                         def _run_tmpl(kernel=kernel, x_p=x_p, w_p=w_p, o_p=o_p,
@@ -1483,6 +1486,7 @@ class LinearGELUBench:
                                 w_p.stride(0), w_p.stride(1),
                                 o_p.stride(0), o_p.stride(1),
                                 BLOCK_M=T, BLOCK_N=T, BLOCK_K=TK,
+                                GROUP_SIZE=8,
                             )
                         times = timed_run(_run_tmpl, warmup=warmup, runs=runs)
                         flops = 2 * M * K * N + M * N  # matmul + gelu
@@ -1495,6 +1499,42 @@ class LinearGELUBench:
                         )
                     except Exception as e:
                         print(f"    [template linear_gelu T={T}, seq={sl}] skipped: {type(e).__name__}")
+
+            # Example — fused: linear_gelu_kernel (2D grid, no GROUP_SIZE)
+            if exmp_layers is not None:
+                kernel_exmp = exmp_layers.linear_gelu_kernel
+                for T in tile_sizes:
+                    TK = max(T // 2, 16)
+                    M_p = _pad_to(M, T); K_p = _pad_to(K, TK); N_p = _pad_to(N, T)
+                    x_p = torch.zeros(M_p, K_p, device=device, dtype=torch.float32)
+                    x_p[:M, :K] = x
+                    w_p = torch.zeros(K_p, N_p, device=device, dtype=torch.float32)
+                    w_p[:K, :N] = wt
+                    o_p = torch.zeros(M_p, N_p, device=device, dtype=torch.float32)
+                    grid = (triton.cdiv(M_p, T), triton.cdiv(N_p, T))
+                    label = f"example_fused_T{T}"
+                    try:
+                        def _run_exmp_fused(kernel=kernel_exmp, x_p=x_p, w_p=w_p, o_p=o_p,
+                                            M_p=M_p, N_p=N_p, K_p=K_p, T=T, TK=TK, grid=grid):
+                            kernel[grid](
+                                x_p, w_p, o_p,
+                                M_p, N_p, K_p,
+                                x_p.stride(0), x_p.stride(1),
+                                w_p.stride(0), w_p.stride(1),
+                                o_p.stride(0), o_p.stride(1),
+                                BLOCK_M=T, BLOCK_N=T, BLOCK_K=TK,
+                            )
+                        times = timed_run(_run_exmp_fused, warmup=warmup, runs=runs)
+                        flops = 2 * M * K * N + M * N
+                        mean  = np.mean(times)
+                        results[sl][label] = BenchResult(
+                            self.NAME, label, sl, f"T={T}",
+                            mean, np.std(times), np.min(times), np.max(times),
+                            (M * K + K * N + M * N) * 4 / (mean / 1000) / 1e9,
+                            flops / (mean / 1000) / 1e12,
+                        )
+                    except Exception as e:
+                        print(f"    [example_fused linear_gelu T={T}, seq={sl}] skipped: {type(e).__name__}")
 
             # Example — unfused: linear_kernel_tf32 then gelu_kernel
             if exmp_layers is not None:
@@ -1557,6 +1597,7 @@ class LinearGELUBench:
                 print(f"    [pytorch linear_gelu, seq={sl}] skipped: {e}")
 
         variants = ([f"template_T{T}" for T in tile_sizes]
+                    + [f"example_fused_T{T}" for T in tile_sizes]
                     + ["example_unfused", "pytorch"])
         variants = [v for v in variants if any(v in results[sl] for sl in seq_lens)]
         print_results(
