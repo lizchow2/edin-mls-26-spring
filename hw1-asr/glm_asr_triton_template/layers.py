@@ -731,6 +731,7 @@ class Linear:
     TILE_M = 64
     TILE_N = 64
     TILE_K = 32
+    GROUP_SIZE = 8
 
     BACKEND = "torch"
 
@@ -847,7 +848,7 @@ class Linear:
             BLOCK_M=self.TILE_M,
             BLOCK_N=self.TILE_N,
             BLOCK_K=self.TILE_K,
-            GROUP_SIZE=8,
+            GROUP_SIZE=self.GROUP_SIZE,
         )
 
         output = output[:M, :N]
@@ -938,6 +939,7 @@ class MLP:
 
     FUSED = True
     TILE_M, TILE_N, TILE_K = 64, 64, 32
+    GROUP_SIZE = 8
 
     def __init__(
         self,
@@ -1050,7 +1052,7 @@ class MLP:
             BLOCK_M=self.TILE_M,
             BLOCK_N=self.TILE_N,
             BLOCK_K=self.TILE_K,
-            GROUP_SIZE=8,
+            GROUP_SIZE=self.GROUP_SIZE,
         )
 
         if M != M_pad or N != N_pad:
@@ -1065,6 +1067,7 @@ class EncoderMLP:
 
     FUSED = True
     TILE_M, TILE_N, TILE_K = 64, 64, 32
+    GROUP_SIZE = 8
 
     def __init__(
         self,
@@ -1153,7 +1156,7 @@ class EncoderMLP:
             BLOCK_M=self.TILE_M,
             BLOCK_N=self.TILE_N,
             BLOCK_K=self.TILE_K,
-            GROUP_SIZE=8
+            GROUP_SIZE=self.GROUP_SIZE,
         )
 
         if M != M_pad or N != N_pad:
