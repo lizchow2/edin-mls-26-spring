@@ -50,13 +50,12 @@ def conv1d_matmul_kernel(
 ):
     """
     Conv1d via matrix multiplication after im2col transformation.
-    Grid: (batch, triton.cdiv(out_length, BLOCK_N))
+    Grid: (batch,)
     """
     pid_b = tl.program_id(0)
-    pid_n = tl.program_id(1)  # output tile index
 
     offs_m = tl.arange(0, BLOCK_M)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_n = tl.arange(0, BLOCK_N)
     offs_k = tl.arange(0, BLOCK_K)
 
     w = tl.load(
@@ -190,9 +189,8 @@ class Conv1d:
         col = im2col_1d(x_padded, self.kernel_size, self.stride)
 
         out_length_padded = next_power_of_two(out_length)
-        BLOCK_N = min(out_length_padded, 256)
 
-        can_use_triton = self.use_triton and x.is_cuda
+        can_use_triton = self.use_triton and out_length_padded <= self.MAX_TILE_DIM and x.is_cuda
 
         if can_use_triton:
             if self.col_size_padded != self.col_size or out_length_padded != out_length:
@@ -215,14 +213,14 @@ class Conv1d:
                 device=x.device,
             )
 
-            grid = (batch, out_length_padded // BLOCK_N)
+            grid = (batch,)
             conv1d_matmul_kernel[grid](
                 col,
                 self.weight_padded,
                 output_padded,
                 self.out_channels_padded,
                 self.col_size_padded,
-                out_length,
+                out_length_padded,
                 col.stride(0),
                 col.stride(1),
                 col.stride(2),
@@ -232,7 +230,7 @@ class Conv1d:
                 output_padded.stride(1),
                 output_padded.stride(2),
                 BLOCK_M=self.out_channels_padded,
-                BLOCK_N=BLOCK_N,
+                BLOCK_N=out_length_padded,
                 BLOCK_K=self.col_size_padded,
             )
 

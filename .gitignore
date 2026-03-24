@@ -27,4 +27,4 @@ requirements.lock
 *.png
 
 triton-tutorial/
-results*/
+results*
