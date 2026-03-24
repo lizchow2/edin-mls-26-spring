@@ -51,6 +51,17 @@ _LINEAR_CONFIGS = [
     triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64,  'GROUP_SIZE': 8}, num_warps=8),
 ]
 
+# Configs for int8 kernel (2D grid, no GROUP_SIZE)
+_LINEAR_INT8_CONFIGS = [
+    triton.Config({'BLOCK_M': 16,  'BLOCK_N': 32,  'BLOCK_K': 32}, num_warps=2),
+    triton.Config({'BLOCK_M': 16,  'BLOCK_N': 64,  'BLOCK_K': 32}, num_warps=4),
+    triton.Config({'BLOCK_M': 32,  'BLOCK_N': 64,  'BLOCK_K': 32}, num_warps=4),
+    triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32}, num_warps=4),
+    triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=8),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 64}, num_warps=8),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=8),
+]
+
 # ============================================================================
 # Triton Kernels
 # ============================================================================
@@ -130,9 +141,20 @@ def fused_residual_rmsnorm_kernel(
     norm_out = (combined * rstd) * w
     tl.store(Norm_Out_ptr + row_idx * stride + cols, norm_out, mask=mask)
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 64,  'BLOCK_K': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 64}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 32}, num_warps=8, num_stages=4),
+    ],
+    key=['M', 'K', 'N_Q', 'N_KV'],
+)
 @triton.jit
 def final_fused_qkv_kernel(
-    x_ptr, w_norm_ptr, w_qkv_ptr, 
+    x_ptr, w_norm_ptr, w_qkv_ptr,
     q_ptr, k_ptr, v_ptr,
     stride_xm, stride_xk,
     stride_qkv_k, stride_qkv_n,
@@ -398,6 +420,7 @@ def linear_kernel_tf16(
         mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
     )
 
+@triton.autotune(configs=_LINEAR_INT8_CONFIGS, key=['M', 'N', 'K'])
 @triton.jit
 def linear_kernel_int8(
     a_ptr,      # (M, K) float32 input
@@ -895,7 +918,7 @@ class FusedRMSNormQKV:
             x_ptr=x, w_norm_ptr=self.norm_weight, w_qkv_ptr=self.qkv_weight,
             q_ptr=q, k_ptr=k, v_ptr=v,
             stride_xm=K, stride_xk=1, stride_qkv_k=self.total_out, stride_qkv_n=1,
-            M=M, K=K, N_Q=self.q_out, N_KV=self.kv_out, eps=self.eps
+            M=M, K=K, N_Q=self.q_out, N_KV=self.kv_out, eps=self.eps,
         )
         return q.reshape(*x.shape[:-1], -1), k.reshape(*x.shape[:-1], -1), v.reshape(*x.shape[:-1], -1)
 
@@ -1173,9 +1196,7 @@ class Linear:
             self._weight_scale = self._weight_scale.to(x.device)
             self.weight = self.weight.to(x.device)
 
-        tile_m = 16 if M <= 16 else 64
-
-        M_padded = pad_to_multiple(M, tile_m)
+        M_padded = pad_to_multiple(M, 128)  # 128 = max BLOCK_M across _LINEAR_INT8_CONFIGS
         K_padded = pad_to_multiple(K, self.TILE_K)
         N_padded = pad_to_multiple(N, self.TILE_N)
 
@@ -1184,12 +1205,12 @@ class Linear:
             x_padded[:M, :K] = x_2d
         else:
             x_padded = x_2d
-        
+
         output = torch.zeros((M_padded, N_padded), dtype=torch.float32, device=x.device)
 
-        grid = (
-            triton.cdiv(M_padded, tile_m),
-            triton.cdiv(N_padded, self.TILE_N),
+        grid = lambda meta: (
+            triton.cdiv(M_padded, meta['BLOCK_M']),
+            triton.cdiv(N_padded, meta['BLOCK_N']),
         )
         linear_kernel_int8[grid](
             x_padded,
@@ -1200,9 +1221,7 @@ class Linear:
             x_padded.stride(0), x_padded.stride(1),
             self._weight_int8.stride(0), self._weight_int8.stride(1),
             output.stride(0), output.stride(1),
-            BLOCK_M=tile_m,
-            BLOCK_N=self.TILE_N,
-            BLOCK_K=self.TILE_K,
+            # BLOCK_M, BLOCK_N, BLOCK_K selected by @triton.autotune
         )
 
         output = output[:M, :N]
