@@ -368,17 +368,6 @@ class AttentionBench:
         tmpl_flash = _load_module("flash", _TEMPLATE_DIR)
         exmp_attn  = _load_module("attention", _EXAMPLE_DIR)
 
-        # Shared memory per block by compute capability (bytes).
-        # Triton opts into the larger carve-out automatically.
-        if torch.cuda.is_available():
-            props = torch.cuda.get_device_properties(0)
-            cc = props.major * 10 + props.minor
-            _SHM = {90: 228*1024, 89: 100*1024, 87: 100*1024,
-                    86: 100*1024, 80: 164*1024, 75: 64*1024, 70: 96*1024}
-            shm_budget = _SHM.get(cc, 48*1024)
-        else:
-            shm_budget = 48*1024
-
         for sl in seq_lens:
             results[sl] = {}
             q = torch.randn(B, H, sl, D, device=device, dtype=torch.float32)
@@ -392,43 +381,45 @@ class AttentionBench:
             k_flat = k.reshape(BH, sl, D).contiguous()
             v_flat = v.reshape(BH, sl, D).contiguous()
 
-            # -- Flash attention variants (template) --
+            # -- Autotuned flash attention (template) --
             if tmpl_flash is not None:
                 kernel = tmpl_flash.compute_flash_attention_kernel
-                for BM in block_sizes:
-                    BN = BM
-                    # Check shared memory constraint
-                    if (2 * BM + BN) * BD * 4 > shm_budget:
-                        continue
-                    label = f"flash{BM}"
-                    out = torch.empty((BH, sl, D), device=device, dtype=torch.float32)
-                    grid = (triton.cdiv(sl, BM), BH)
-                    try:
-                        def _run_flash(BM=BM, BN=BN, BD=BD, out=out, grid=grid):
-                            kernel[grid](
-                                q_flat, k_flat, v_flat, out,
-                                float(scale), sl, sl, D,
-                                q_flat.stride(0), q_flat.stride(1), q_flat.stride(2),
-                                k_flat.stride(0), k_flat.stride(1), k_flat.stride(2),
-                                v_flat.stride(0), v_flat.stride(1), v_flat.stride(2),
-                                out.stride(0),    out.stride(1),    out.stride(2),
-                                q_flat,  # dummy mask ptr
-                                0, 0, 0,
-                                HAS_MASK=False, IS_CAUSAL=False,
-                                BLOCK_M=BM, BLOCK_N=BN, BLOCK_D=BD,
-                            )
-                        times = timed_run(_run_flash, warmup=warmup, runs=runs)
-                        flops = 4 * B * H * sl * sl * D
-                        bw    = B * H * D * (3 * sl + sl) * 4  # no attn matrix in HBM
-                        mean  = np.mean(times)
-                        results[sl][label] = BenchResult(
-                            kernel=self.NAME, variant=label, seq_len=sl, block_label=f"BM{BM}/BN{BN}",
-                            mean_ms=mean, std_ms=np.std(times), min_ms=np.min(times), max_ms=np.max(times),
-                            bw_gb=bw / (mean / 1000) / 1e9,
-                            tflops=flops / (mean / 1000) / 1e12,
+                label = "flash_autotuned"
+                out = torch.empty((BH, sl, D), device=device, dtype=torch.float32)
+                try:
+                    def _run_flash_auto(BD=BD, out=out, sl=sl, BH=BH):
+                        kernel[lambda meta: (triton.cdiv(sl, meta['BLOCK_M']), BH)](
+                            q_flat, k_flat, v_flat, out,
+                            float(scale), sl, sl, D,
+                            q_flat.stride(0), q_flat.stride(1), q_flat.stride(2),
+                            k_flat.stride(0), k_flat.stride(1), k_flat.stride(2),
+                            v_flat.stride(0), v_flat.stride(1), v_flat.stride(2),
+                            out.stride(0),    out.stride(1),    out.stride(2),
+                            q_flat,  # dummy mask ptr
+                            0, 0, 0,
+                            HAS_MASK=False, IS_CAUSAL=False,
+                            BLOCK_D=BD,
+                            # BLOCK_M, BLOCK_N chosen by @triton.autotune
                         )
-                    except Exception as e:
-                        print(f"    [flash{BM}, seq={sl}] skipped: {type(e).__name__}: {e}")
+                    # Trigger autotune search + JIT compilation BEFORE warmup
+                    _run_flash_auto()
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    # Extract the winning config selected by autotune for this seq_len
+                    best_cfg = kernel.best_config
+                    block_label = f"BM{best_cfg.kwargs['BLOCK_M']}/BN{best_cfg.kwargs['BLOCK_N']}"
+                    times = timed_run(_run_flash_auto, warmup=warmup, runs=runs)
+                    flops = 4 * B * H * sl * sl * D
+                    bw    = B * H * D * (3 * sl + sl) * 4  # no attn matrix in HBM
+                    mean  = np.mean(times)
+                    results[sl][label] = BenchResult(
+                        kernel=self.NAME, variant=label, seq_len=sl, block_label=block_label,
+                        mean_ms=mean, std_ms=np.std(times), min_ms=np.min(times), max_ms=np.max(times),
+                        bw_gb=bw / (mean / 1000) / 1e9,
+                        tflops=flops / (mean / 1000) / 1e12,
+                    )
+                except Exception as e:
+                    print(f"    [flash_autotuned, seq={sl}] skipped: {type(e).__name__}: {e}")
 
             # -- Example: 3-kernel basic attention --
             if exmp_attn is not None:
@@ -469,7 +460,7 @@ class AttentionBench:
             except Exception as e:
                 print(f"    [pytorch, seq={sl}] skipped: {e}")
 
-        variants = [f"flash{b}" for b in block_sizes] + ["example_basic", "pytorch"]
+        variants = ["flash_autotuned", "example_basic", "pytorch"]
         variants = [v for v in variants if any(v in results[sl] for sl in seq_lens)]
 
         print_results(
@@ -678,13 +669,10 @@ class LinearBench:
         import triton
 
         device = _device()
-        tile_sizes = block_sizes if block_sizes else self.DEFAULT_BLOCK_SIZES
         results: Dict[int, Dict[str, BenchResult]] = {}
 
         tmpl_layers = _load_module("layers", _TEMPLATE_DIR)
         exmp_layers = _load_module("layers", _EXAMPLE_DIR)
-
-        def _pad_to(n, m): return ((n + m - 1) // m) * m
 
         for sl in seq_lens:
             results[sl] = {}
@@ -697,45 +685,34 @@ class LinearBench:
             wt = torch.randn(K, N, device=device, dtype=torch.float32)
             out_buf = torch.empty(M, N, device=device, dtype=torch.float32)
 
-            # Template — sweep tile sizes
+            # Template — autotuned kernel (BLOCK sizes managed by @triton.autotune)
             if tmpl_layers is not None:
-                kernel = tmpl_layers.linear_kernel_tf32
-                for T in tile_sizes:
-                    TK = max(T // 2, 16)
-                    M_p = _pad_to(M, T)
-                    K_p = _pad_to(K, TK)
-                    N_p = _pad_to(N, T)
-                    # Pad inputs
-                    x_p = torch.zeros(M_p, K_p, device=device, dtype=torch.float32)
-                    x_p[:M, :K] = x
-                    w_p = torch.zeros(K_p, N_p, device=device, dtype=torch.float32)
-                    w_p[:K, :N] = wt
-                    o_p = torch.zeros(M_p, N_p, device=device, dtype=torch.float32)
-                    grid = (triton.cdiv(M_p, T) * triton.cdiv(N_p, T),)  # flat 1D grid
-                    label = f"template_T{T}"
-                    try:
-                        def _run_tmpl(kernel=kernel, x_p=x_p, w_p=w_p, o_p=o_p,
-                                      M_p=M_p, N_p=N_p, K_p=K_p, T=T, TK=TK, grid=grid):
-                            kernel[grid](
-                                x_p, w_p, o_p,
-                                M_p, N_p, K_p,
-                                x_p.stride(0), x_p.stride(1),
-                                w_p.stride(0), w_p.stride(1),
-                                o_p.stride(0), o_p.stride(1),
-                                BLOCK_M=T, BLOCK_N=T, BLOCK_K=TK,
-                                GROUP_SIZE=8,
-                            )
-                        times = timed_run(_run_tmpl, warmup=warmup, runs=runs)
-                        flops = 2 * M * K * N
-                        bw    = (M * K + K * N + M * N) * 4
-                        mean  = np.mean(times)
-                        results[sl][label] = BenchResult(
-                            self.NAME, label, sl, f"T={T}",
-                            mean, np.std(times), np.min(times), np.max(times),
-                            bw / (mean / 1000) / 1e9, flops / (mean / 1000) / 1e12,
+                label = "template_autotuned"
+                o = torch.empty(M, N, device=device, dtype=torch.float32)
+                try:
+                    def _run_tmpl(kernel=tmpl_layers.linear_kernel_tf32,
+                                  x=x, wt=wt, o=o, M=M, N=N, K=K):
+                        grid = lambda META: (
+                            triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']),
                         )
-                    except Exception as e:
-                        print(f"    [template linear T={T}, seq={sl}] skipped: {type(e).__name__}")
+                        kernel[grid](
+                            x, wt, o,
+                            M, N, K,
+                            x.stride(0), x.stride(1),
+                            wt.stride(0), wt.stride(1),
+                            o.stride(0), o.stride(1),
+                        )
+                    times = timed_run(_run_tmpl, warmup=warmup, runs=runs)
+                    flops = 2 * M * K * N
+                    bw    = (M * K + K * N + M * N) * 4
+                    mean  = np.mean(times)
+                    results[sl][label] = BenchResult(
+                        self.NAME, label, sl, "autotuned",
+                        mean, np.std(times), np.min(times), np.max(times),
+                        bw / (mean / 1000) / 1e9, flops / (mean / 1000) / 1e12,
+                    )
+                except Exception as e:
+                    print(f"    [template linear autotuned, seq={sl}] skipped: {type(e).__name__}: {e}")
 
             # Example — uses BACKEND="cublas" (torch matmul) by default
             if exmp_layers is not None:
@@ -774,8 +751,7 @@ class LinearBench:
             except Exception as e:
                 print(f"    [pytorch linear, seq={sl}] skipped: {e}")
 
-        variants = ([f"template_T{T}" for T in tile_sizes]
-                    + ["example_cublas", "pytorch"])
+        variants = ["template_autotuned", "example_cublas", "pytorch"]
         variants = [v for v in variants if any(v in results[sl] for sl in seq_lens)]
         print_results(
             f"Linear GEMM Benchmark  (M=seq_len, K={hidden_size}, N={out_size}, {device})",
@@ -803,12 +779,9 @@ class SwiGLUBench:
         import triton
 
         device = _device()
-        tile_sizes = block_sizes if block_sizes else self.DEFAULT_BLOCK_SIZES
         results: Dict[int, Dict[str, BenchResult]] = {}
 
         tmpl_layers = _load_module("layers", _TEMPLATE_DIR)
-
-        def _pad_to(n, m): return ((n + m - 1) // m) * m
 
         for sl in seq_lens:
             results[sl] = {}
@@ -818,44 +791,35 @@ class SwiGLUBench:
             gate_w = torch.randn(K, N, device=device, dtype=torch.float32)
             up_w   = torch.randn(K, N, device=device, dtype=torch.float32)
 
-            # Template fused SwiGLU
+            # Template fused SwiGLU — autotuned kernel
             if tmpl_layers is not None:
-                kernel = tmpl_layers.swiglu_fused_kernel
-                for T in tile_sizes:
-                    TK = max(T // 2, 16)
-                    M_p = _pad_to(M, T); K_p = _pad_to(K, TK); N_p = _pad_to(N, T)
-                    x_p = torch.zeros(M_p, K_p, device=device, dtype=torch.float32)
-                    x_p[:M, :K] = x
-                    g_p = torch.zeros(K_p, N_p, device=device, dtype=torch.float32)
-                    g_p[:K, :N] = gate_w
-                    u_p = torch.zeros(K_p, N_p, device=device, dtype=torch.float32)
-                    u_p[:K, :N] = up_w
-                    o_p = torch.zeros(M_p, N_p, device=device, dtype=torch.float32)
-                    grid = (triton.cdiv(M_p, T) * triton.cdiv(N_p, T),)  # flat 1D grid
-                    label = f"template_T{T}"
-                    try:
-                        def _run_fused(kernel=kernel, x_p=x_p, g_p=g_p, u_p=u_p, o_p=o_p,
-                                       M_p=M_p, N_p=N_p, K_p=K_p, T=T, TK=TK, grid=grid):
-                            kernel[grid](
-                                x_p, g_p, u_p, o_p,
-                                M_p, N_p, K_p,
-                                x_p.stride(0), x_p.stride(1),
-                                g_p.stride(0), g_p.stride(1),
-                                u_p.stride(0), u_p.stride(1),
-                                o_p.stride(0), o_p.stride(1),
-                                BLOCK_M=T, BLOCK_N=T, BLOCK_K=TK,
-                                GROUP_SIZE=8,
-                            )
-                        times = timed_run(_run_fused, warmup=warmup, runs=runs)
-                        flops = 2 * 2 * M * K * N + M * N  # gate+up matmuls + silu+mul
-                        mean  = np.mean(times)
-                        results[sl][label] = BenchResult(
-                            self.NAME, label, sl, f"T={T}",
-                            mean, np.std(times), np.min(times), np.max(times),
-                            NA, flops / (mean / 1000) / 1e12,
+                label = "template_autotuned"
+                o = torch.empty(M, N, device=device, dtype=torch.float32)
+                try:
+                    def _run_fused(kernel=tmpl_layers.swiglu_fused_kernel,
+                                   x=x, gate_w=gate_w, up_w=up_w, o=o,
+                                   M=M, N=N, K=K):
+                        grid = lambda META: (
+                            triton.cdiv(M, META['BLOCK_M']) * triton.cdiv(N, META['BLOCK_N']),
                         )
-                    except Exception as e:
-                        print(f"    [template swiglu T={T}, seq={sl}] skipped: {type(e).__name__}")
+                        kernel[grid](
+                            x, gate_w, up_w, o,
+                            M, N, K,
+                            x.stride(0), x.stride(1),
+                            gate_w.stride(0), gate_w.stride(1),
+                            up_w.stride(0), up_w.stride(1),
+                            o.stride(0), o.stride(1),
+                        )
+                    times = timed_run(_run_fused, warmup=warmup, runs=runs)
+                    flops = 2 * 2 * M * K * N + M * N  # gate+up matmuls + silu+mul
+                    mean  = np.mean(times)
+                    results[sl][label] = BenchResult(
+                        self.NAME, label, sl, "autotuned",
+                        mean, np.std(times), np.min(times), np.max(times),
+                        NA, flops / (mean / 1000) / 1e12,
+                    )
+                except Exception as e:
+                    print(f"    [template swiglu autotuned, seq={sl}] skipped: {type(e).__name__}: {e}")
 
             # Example unfused (separate matmuls)
             label = "example_unfused"
@@ -893,8 +857,7 @@ class SwiGLUBench:
             except Exception as e:
                 print(f"    [pytorch swiglu, seq={sl}] skipped: {e}")
 
-        variants = ([f"template_T{T}" for T in tile_sizes]
-                    + ["example_unfused", "pytorch"])
+        variants = ["template_autotuned", "example_unfused", "pytorch"]
         variants = [v for v in variants if any(v in results[sl] for sl in seq_lens)]
         print_results(
             f"SwiGLU Benchmark  (M=seq_len, K={hidden_size}, N={interm_size}, {device})",
@@ -1015,7 +978,7 @@ class Conv1dBench:
                 out_ch_p    = next_power_of_two(out_ch)
                 out_len_p   = next_power_of_two(out_len)
 
-                if col_size_p > 256 or out_ch_p > 256 or out_len_p > 256:
+                if col_size_p > 256 or out_ch_p > 256:
                     continue
 
                 x   = torch.randn(1, in_channels, sl, device=device, dtype=torch.float32)
@@ -1036,16 +999,18 @@ class Conv1dBench:
                         out_p = torch.zeros(1, out_ch_p, out_len_p, device=device, dtype=torch.float32)
 
                         kernel_fn = mod.conv1d_matmul_kernel
+                        BLOCK_N = min(out_len_p, 256)
                         def _run(kernel_fn=kernel_fn, col_p=col_p, w_p=w_p, out_p=out_p,
                                  out_ch_p=out_ch_p, col_size_p=col_size_p, out_len_p=out_len_p,
-                                 out_ch=out_ch, col_size=col_size, out_len=out_len):
-                            kernel_fn[(1,)](
+                                 out_ch=out_ch, col_size=col_size, out_len=out_len,
+                                 BLOCK_N=BLOCK_N):
+                            kernel_fn[(1, out_len_p // BLOCK_N)](
                                 col_p, w_p, out_p,
                                 out_ch, col_size, out_len,
                                 col_p.stride(0), col_p.stride(1), col_p.stride(2),
                                 w_p.stride(0),   w_p.stride(1),
                                 out_p.stride(0), out_p.stride(1), out_p.stride(2),
-                                BLOCK_M=out_ch_p, BLOCK_N=out_len_p, BLOCK_K=col_size_p,
+                                BLOCK_M=out_ch_p, BLOCK_N=BLOCK_N, BLOCK_K=col_size_p,
                             )
                         times = timed_run(_run, warmup=warmup, runs=runs)
                         mean  = np.mean(times)

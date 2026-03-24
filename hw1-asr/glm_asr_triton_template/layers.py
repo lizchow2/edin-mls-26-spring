@@ -38,6 +38,20 @@ def next_power_of_two(x: int) -> int:
 
 
 # ============================================================================
+# Autotune configs for matmul-style kernels
+# ============================================================================
+
+_LINEAR_CONFIGS = [
+    triton.Config({'BLOCK_M': 16,  'BLOCK_N': 32,  'BLOCK_K': 32,  'GROUP_SIZE': 8}, num_warps=2),
+    triton.Config({'BLOCK_M': 16,  'BLOCK_N': 64,  'BLOCK_K': 32,  'GROUP_SIZE': 8}, num_warps=4),
+    triton.Config({'BLOCK_M': 32,  'BLOCK_N': 64,  'BLOCK_K': 32,  'GROUP_SIZE': 8}, num_warps=4),
+    triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32,  'GROUP_SIZE': 8}, num_warps=4),
+    triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 64,  'GROUP_SIZE': 8}, num_warps=8),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 64,  'GROUP_SIZE': 8}, num_warps=8),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64,  'GROUP_SIZE': 8}, num_warps=8),
+]
+
+# ============================================================================
 # Triton Kernels
 # ============================================================================
 # <logic-sync>
@@ -267,6 +281,7 @@ def silu_kernel(x_ptr, y_ptr, n_elements, BLOCK_SIZE: tl.constexpr):
 
 
 
+@triton.autotune(configs=_LINEAR_CONFIGS, key=['M', 'N', 'K'])
 @triton.jit
 def linear_kernel_tf32(
     a_ptr,
@@ -329,18 +344,6 @@ def linear_kernel_tf32(
     
     tl.store(c_ptr + c_offsets, accumulator, mask=c_mask)
 
-# @triton.autotune(
-#     configs=[
-#         triton.Config({'BLOCK_M': 16, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=2),
-#         triton.Config({'BLOCK_M': 16, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4),
-#         triton.Config({'BLOCK_M': 16, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4),
-#         triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4),
-#         triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4),
-#         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4),
-#         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=8),
-#     ],
-#     key=['M', 'N', 'K'],
-# )
 @triton.jit
 def linear_kernel_tf16(
     a_ptr,
@@ -447,6 +450,7 @@ def linear_kernel_int8(
         mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
     )
 
+@triton.autotune(configs=_LINEAR_CONFIGS, key=['M', 'N', 'K'])
 @triton.jit
 def linear_gelu_kernel(
     a_ptr,
@@ -503,7 +507,7 @@ def linear_gelu_kernel(
     sqrt_2_over_pi = 0.7978845608028654
     acc3 = accumulator * accumulator * accumulator
     inner = sqrt_2_over_pi * (accumulator + 0.044715 * acc3)
-    accumulator = accumulator * 0.5 * (1.0 + tl.libdevice.tanh(inner))
+    accumulator = accumulator * 0.5 * (1.0 + tl.extra.cuda.libdevice.tanh(inner))
 
     tl.store(
         c_ptr + c_offsets,
@@ -512,6 +516,7 @@ def linear_gelu_kernel(
     )
 
 
+@triton.autotune(configs=_LINEAR_CONFIGS, key=['M', 'N', 'K'])
 @triton.jit
 def swiglu_fused_kernel(
     a_ptr,
@@ -1119,8 +1124,8 @@ class Linear:
             (M_padded, self._N_padded), dtype=torch.float32, device=x.device
         )
 
-        grid = (
-            triton.cdiv(M_padded, self.TILE_M) * triton.cdiv(self._N_padded, self.TILE_N),
+        grid = lambda meta: (
+            triton.cdiv(M_padded, meta['BLOCK_M']) * triton.cdiv(self._N_padded, meta['BLOCK_N']),
         )
 
         linear_kernel_tf32[grid](
@@ -1136,10 +1141,7 @@ class Linear:
             self._weight_t_padded.stride(1),
             output.stride(0),
             output.stride(1),
-            BLOCK_M=self.TILE_M,
-            BLOCK_N=self.TILE_N,
-            BLOCK_K=self.TILE_K,
-            GROUP_SIZE=8,
+            # BLOCK_M, BLOCK_N, BLOCK_K, GROUP_SIZE chosen by @triton.autotune
         )
 
         output = output[:M, :N]
@@ -1381,8 +1383,8 @@ class MLP:
             (M_pad, N_pad), dtype=torch.float32, device=x.device
         )
 
-        grid = (
-            triton.cdiv(M_pad, self.TILE_M) * triton.cdiv(N_pad, self.TILE_N),
+        grid = lambda meta: (
+            triton.cdiv(M_pad, meta['BLOCK_M']) * triton.cdiv(N_pad, meta['BLOCK_N']),
         )
         swiglu_fused_kernel[grid](
             x_padded,
@@ -1400,10 +1402,7 @@ class MLP:
             up_w_padded.stride(1),
             intermediate.stride(0),
             intermediate.stride(1),
-            BLOCK_M=self.TILE_M,
-            BLOCK_N=self.TILE_N,
-            BLOCK_K=self.TILE_K,
-            GROUP_SIZE=8,
+            # BLOCK_M, BLOCK_N, BLOCK_K, GROUP_SIZE chosen by @triton.autotune
         )
 
         if M != M_pad or N != N_pad:
@@ -1487,8 +1486,8 @@ class EncoderMLP:
             (M_pad, N_pad), dtype=torch.float32, device=x.device
         )
 
-        grid = (
-            triton.cdiv(M_pad, self.TILE_M) * triton.cdiv(N_pad, self.TILE_N),
+        grid = lambda meta: (
+            triton.cdiv(M_pad, meta['BLOCK_M']) * triton.cdiv(N_pad, meta['BLOCK_N']),
         )
         linear_gelu_kernel[grid](
             x_padded,
@@ -1503,10 +1502,7 @@ class EncoderMLP:
             fc1_w_padded.stride(1),
             intermediate.stride(0),
             intermediate.stride(1),
-            BLOCK_M=self.TILE_M,
-            BLOCK_N=self.TILE_N,
-            BLOCK_K=self.TILE_K,
-            GROUP_SIZE=8
+            # BLOCK_M, BLOCK_N, BLOCK_K, GROUP_SIZE chosen by @triton.autotune
         )
 
         if M != M_pad or N != N_pad:

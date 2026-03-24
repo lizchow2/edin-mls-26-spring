@@ -7,6 +7,39 @@ import triton
 import triton.language as tl
 
 
+def _flash_shm_budget() -> int:
+    """Return shared memory budget in bytes for the current GPU."""
+    if not torch.cuda.is_available():
+        return 48 * 1024
+    cc = torch.cuda.get_device_capability()
+    budgets = {
+        (9, 0): 228 * 1024, (8, 9): 100 * 1024, (8, 7): 100 * 1024,
+        (8, 6): 100 * 1024, (8, 0): 164 * 1024, (7, 5): 64 * 1024, (7, 0): 96 * 1024,
+    }
+    return budgets.get(cc, 48 * 1024)
+
+
+def _make_flash_configs(shm_budget: int, block_d: int = 128):
+    """Generate valid flash attention autotune configs filtered by shared memory constraint."""
+    candidates = [
+        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 16}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 16}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_warps=8, num_stages=3),
+    ]
+    # Each SM needs q_tile (BLOCK_M, BLOCK_D) + acc (BLOCK_M, BLOCK_D) + k/v tile (BLOCK_N, BLOCK_D)
+    return [
+        cfg for cfg in candidates
+        if (2 * cfg.kwargs['BLOCK_M'] + cfg.kwargs['BLOCK_N']) * block_d * 4 <= shm_budget
+    ]
+
+
+_FLASH_CONFIGS = _make_flash_configs(_flash_shm_budget())
+
+
 """
 TLDR:
 Flash Attention: fused attention using online softmax to avoid materializing
@@ -84,6 +117,10 @@ Online softmax fixes this with one key identity:
 
 
 
+@triton.autotune(
+    configs=_FLASH_CONFIGS,
+    key=['seq_q', 'seq_k', 'head_dim'],
+)
 @triton.jit
 def compute_flash_attention_kernel(
     q_ptr,                  # (BH, seq_q, head_dim)
@@ -262,17 +299,9 @@ def flash_attention_fwd_triton(
 
     out = torch.empty((BH, Q, D), device=q.device, dtype=torch.float32)
 
-    # Compute block sizes that fit within 64 KB shared memory.
-    # Triton allocates (2*BLOCK_M + BLOCK_N) * BLOCK_D * 4 bytes:
-    #   q_tile (BLOCK_M, BLOCK_D) + acc (BLOCK_M, BLOCK_D) + k/v tiles (BLOCK_N, BLOCK_D).
-    # BLOCK_D must be >= head_dim and a power of two for correct loads.
+    # BLOCK_D must be >= head_dim and a power of two; autotune selects BLOCK_M and BLOCK_N.
     BLOCK_D = next_power_of_two(D)
-    shm_budget = 49152  # 48 KB — leaves headroom below the 64 KB hardware limit
-    max_sum = max(32, shm_budget // (BLOCK_D * 4))  # budget for (2*BLOCK_M + BLOCK_N)
-    BLOCK_N = max(16, min(64, max_sum // 3))
-    BLOCK_M = max(16, min(64, (max_sum - BLOCK_N) // 2))
-
-    grid = (triton.cdiv(Q, BLOCK_M), BH)
+    grid = lambda meta: (triton.cdiv(Q, meta['BLOCK_M']), BH)
 
     compute_flash_attention_kernel[grid](
         q_flat, k_flat, v_flat, out,
@@ -288,9 +317,8 @@ def flash_attention_fwd_triton(
         mask_flat.stride(2) if mask_flat is not None else 0,
         HAS_MASK=mask_flat is not None,
         IS_CAUSAL=is_causal,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
         BLOCK_D=BLOCK_D,
+        # BLOCK_M and BLOCK_N are chosen by @triton.autotune
     )
 
     return out.reshape(B, H, Q, D).to(dtype=q.dtype)

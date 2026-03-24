@@ -11,7 +11,6 @@ __pycache__/
 .venv
 env/
 venv/
-results/
 # IDE
 .idea/
 .vscode/
@@ -28,3 +27,4 @@ requirements.lock
 *.png
 
 triton-tutorial/
+results*/
