@@ -17,7 +17,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ---------------------------------------------------------------------------
 
 PROJECT_DIR=${PROJECT_DIR:-/home/$USER/projects/edin-mls-26-spring}
-VENV_PATH=${VENV_PATH:-/home/$USER/}
 
 # Kernel microbenchmark settings
 RUNS=${RUNS:-100}
@@ -99,11 +98,16 @@ trap 'on_exit' EXIT
 # ---------------------------------------------------------------------------
 
 cd "$PROJECT_DIR"
-conda init
-conda activate mls
 
+# Activate conda env in a non-interactive shell
+CONDA_BASE=$(conda info --base 2>/dev/null || echo "")
+if [ -n "$CONDA_BASE" ] && [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
+  source "$CONDA_BASE/etc/profile.d/conda.sh"
+  conda activate mls
 else
-  log "WARNING: venv not found at $VENV_PATH — using system python"
+  log "WARNING: conda not found — trying eval shell hook fallback"
+  eval "$(conda shell.bash hook 2>/dev/null)" || true
+  conda activate mls
 fi
 
 log "===================================="
