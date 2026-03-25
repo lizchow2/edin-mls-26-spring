@@ -16,8 +16,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Config (all overridable via environment variables)
 # ---------------------------------------------------------------------------
 
-PROJECT_DIR=${PROJECT_DIR:-$SCRIPT_DIR}
-VENV_PATH=${VENV_PATH:-/home/$USER/.asr_env}
+PROJECT_DIR=${PROJECT_DIR:-/home/$USER/projects/edin-mls-26-spring}
+VENV_PATH=${VENV_PATH:-/home/$USER/}
 
 # Kernel microbenchmark settings
 RUNS=${RUNS:-100}
@@ -100,8 +100,8 @@ trap 'on_exit' EXIT
 
 cd "$PROJECT_DIR"
 
-if [ -f "$VENV_PATH/bin/activate" ]; then
-  source "$VENV_PATH/bin/activate"
+conda activate mls
+
 else
   log "WARNING: venv not found at $VENV_PATH — using system python"
 fi
