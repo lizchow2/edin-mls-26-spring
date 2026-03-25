@@ -38,6 +38,7 @@ import torch
 _SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
 _TEMPLATE_DIR = os.path.join(_SCRIPT_DIR, "glm_asr_triton_template")
 _EXAMPLE_DIR  = os.path.join(_SCRIPT_DIR, "glm_asr_triton_example")
+_SCRATCH_DIR  = os.path.join(_SCRIPT_DIR, "glm_asr_scratch")
 
 
 def _load_module(name: str, directory: str):
@@ -2118,6 +2119,35 @@ def _get_reference(segments, n_samp: int) -> str:
     return " ".join(parts)
 
 
+def _load_librispeech_utterances(data_dir: str, n: int = 15):
+    """Load up to n individual LibriSpeech test-clean utterances as (audio, transcript) pairs."""
+    try:
+        import torchaudio  # type: ignore
+    except ImportError:
+        print("  [correctness] torchaudio not found – returning empty utterance list.")
+        return []
+    os.makedirs(data_dir, exist_ok=True)
+    try:
+        dataset = torchaudio.datasets.LIBRISPEECH(data_dir, url="test-clean", download=True)
+    except Exception as e:
+        print(f"  [correctness] LibriSpeech load failed ({e})")
+        return []
+    utterances = []
+    for idx in range(min(len(dataset), n)):
+        waveform, sr, transcript, *_ = dataset[idx]
+        arr = waveform.squeeze(0).numpy().astype(np.float32)
+        if sr != 16000:
+            try:
+                import librosa  # type: ignore
+                arr = librosa.resample(arr, orig_sr=sr, target_sr=16000)
+            except ImportError:
+                from scipy.signal import resample as sp_resample
+                arr = sp_resample(arr, int(len(arr) * 16000 / sr)).astype(np.float32)
+        utterances.append((arr, transcript.strip()))
+    print(f"  [correctness] Loaded {len(utterances)} utterances from LibriSpeech test-clean")
+    return utterances
+
+
 def _prepare_inputs(processor, audio: np.ndarray, device: torch.device):
     """Prepare model inputs from a raw audio array; return (input_features, input_ids, mask)."""
     if hasattr(processor, "apply_transcription_request"):
@@ -2140,80 +2170,276 @@ def _prepare_inputs(processor, audio: np.ndarray, device: torch.device):
     return input_features, input_ids, mask
 
 
-def benchmark_model_sweep(
+def _model_unload(folder):
+    """Remove folder from sys.path and purge loaded model modules."""
+    if folder in sys.path:
+        sys.path.remove(folder)
+    for mod_name in list(sys.modules.keys()):
+        if mod_name in ["weight_loader", "model", "layers", "attention",
+                        "flash", "rope", "conv"]:
+            del sys.modules[mod_name]
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+
+
+def _model_load(folder):
+    """Insert folder at front of sys.path and evict stale model modules."""
+    if folder not in sys.path:
+        sys.path.insert(0, folder)
+    for mod_name in list(sys.modules.keys()):
+        if mod_name in ["weight_loader", "model", "layers", "attention",
+                        "flash", "rope", "conv"]:
+            del sys.modules[mod_name]
+
+
+def benchmark_model_correctness(
     data_dir: str = None,
-    target_seq_lens: List[int] = None,
-    warmup: int = 2,
-    runs: int = 5,
-    max_new_tokens: int = 10,
+    n_utterances: int = 15,
+    max_new_tokens: int = 200,
     save_dir: str = None,
     do_plot: bool = False,
 ):
-    """Sweep the full model over multiple audio sequence lengths using LibriSpeech.
+    """Evaluate WER/CER on individual LibriSpeech utterances across three model variants.
 
-    For each target seq_len the audio is truncated to the corresponding duration;
-    both template and example models are benchmarked once (model loaded once per
-    variant) and results are printed as a comparison table.
+    Compares scratch (PyTorch baseline) / example (reference Triton) / template (student).
+    Uses a generation budget large enough to avoid output truncation.
     """
-    if target_seq_lens is None:
-        target_seq_lens = [64, 128, 256, 512, 1024]
     if data_dir is None:
         data_dir = _LIBRISPEECH_DATA_DIR
 
     print("\n" + "=" * 72)
-    print("MODEL SWEEP: glm_asr_triton_template vs glm_asr_triton_example")
-    print(f"  seq_lens      = {target_seq_lens}")
-    print(f"  warmup/runs   = {warmup}/{runs}   max_new_tokens={max_new_tokens}")
+    print("CORRECTNESS E2E  (scratch vs example vs template)")
+    print(f"  utterances    = {n_utterances}   max_new_tokens = {max_new_tokens}")
     print("=" * 72)
 
     device = _device()
+    utterances = _load_librispeech_utterances(data_dir, n=n_utterances)
+    if not utterances:
+        print("  No utterances loaded – aborting.")
+        return
 
-    # How many audio samples are needed for the largest seq_len?
-    max_seq_len = max(target_seq_lens)
-    max_samples_needed = max_seq_len * _SAMPLES_PER_TOKEN + 16000  # +1s headroom
-
-    audio_full, _segments = _load_librispeech_samples(data_dir, max_samples_needed)
-
-    # Map seq_len → sample count, capped to available audio length
-    def _n_samples(seq_len: int) -> int:
-        return min(seq_len * _SAMPLES_PER_TOKEN, len(audio_full))
-
-    # Results: label → list of dicts (one per seq_len)
     all_results: Dict[str, List[dict]] = {}
 
-    for folder, label in [(_TEMPLATE_DIR, "template"), (_EXAMPLE_DIR, "example")]:
+    for folder, label in [
+        (_SCRATCH_DIR,   "scratch"),
+        (_EXAMPLE_DIR,   "example"),
+        (_TEMPLATE_DIR,  "template"),
+    ]:
+        if not os.path.isdir(folder):
+            print(f"\n  [{label}] directory not found: {folder} – skipping.")
+            continue
+
         print(f"\n[{label}] Loading model from {os.path.basename(folder)}...")
-        if folder not in sys.path:
-            sys.path.insert(0, folder)
-        for mod_name in list(sys.modules.keys()):
-            if mod_name in ["weight_loader", "model", "layers", "attention",
-                            "flash", "rope", "conv"]:
-                del sys.modules[mod_name]
+        _model_load(folder)
+        label_results: List[dict] = []
 
         try:
             from weight_loader import load_model_from_hf
             model, processor = load_model_from_hf("zai-org/GLM-ASR-Nano-2512")
-
             generate_fn = getattr(model, "generate_v8b",
                           getattr(model, "generate_v8",
                           getattr(model, "generate_v6", model.generate)))
 
+            for utt_idx, (audio, reference) in enumerate(utterances):
+                duration = len(audio) / 16000
+                input_features, input_ids, mask = _prepare_inputs(processor, audio, device)
+
+                kw = dict(input_features=input_features,
+                          input_ids=input_ids,
+                          max_new_tokens=max_new_tokens,
+                          temperature=1.0, top_k=1)
+                if mask is not None:
+                    kw["input_features_mask"] = mask
+                try:
+                    output = generate_fn(**kw)
+                except TypeError:
+                    kw.pop("input_features_mask", None)
+                    output = generate_fn(**kw)
+
+                hypothesis = _decode_output(output, input_ids.shape[-1], processor) \
+                    if hasattr(output, "shape") else ""
+                wer, cer = _wer_cer(hypothesis, reference)
+
+                print(f"  [{label}] utt {utt_idx:2d} ({duration:.1f}s): "
+                      f"WER={wer:.3f}  CER={cer:.3f}")
+                _show = lambda s, n=120: s[:n] + "..." if len(s) > n else s
+                print(f"    ref: {_show(reference)}")
+                print(f"    hyp: {_show(hypothesis)}")
+
+                label_results.append({
+                    "utterance_idx": utt_idx,
+                    "duration_s":    duration,
+                    "wer":           wer,
+                    "cer":           cer,
+                    "hypothesis":    hypothesis,
+                    "reference":     reference,
+                })
+
+        except Exception as e:
+            print(f"  ERROR in {label}: {e}")
+            import traceback; traceback.print_exc()
+        finally:
+            try:
+                del model
+                del processor
+            except Exception:
+                pass
+            _model_unload(folder)
+
+        all_results[label] = label_results
+
+    # ------------------------------------------------------------------ #
+    # Aggregate summary                                                    #
+    # ------------------------------------------------------------------ #
+    labels_present = [l for l in ["scratch", "example", "template"] if l in all_results]
+    if not labels_present:
+        return
+
+    col_w = 13
+
+    def _hdr(name): return f"{name:>{col_w}s}"
+    def _val(v, fmt=".3f"): return f"{v:{col_w}{fmt}}" if not math.isnan(v) else f"{'N/A':>{col_w}s}"
+
+    print("\n" + "=" * 72)
+    print(f"CORRECTNESS SUMMARY  (n={n_utterances} utterances, max_new_tokens={max_new_tokens})")
+    print("=" * 72)
+
+    for metric_key, metric_label in [("wer", "Mean WER"), ("cer", "Mean CER")]:
+        print(f"\n{metric_label}")
+        hdr = f"{'':>12s}" + "".join(_hdr(l) for l in labels_present)
+        print(hdr); print("-" * len(hdr))
+        vals = []
+        for lbl in labels_present:
+            v = float(np.mean([e[metric_key] for e in all_results[lbl]])) \
+                if all_results[lbl] else float("nan")
+            vals.append(v)
+        row = f"{'mean':>12s}" + "".join(_val(v) for v in vals)
+        print(row)
+
+    # ------------------------------------------------------------------ #
+    # CSV                                                                  #
+    # ------------------------------------------------------------------ #
+    if save_dir:
+        import csv
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.join(save_dir, "correctness_results.csv")
+        fields = ["label", "utterance_idx", "duration_s", "wer", "cer",
+                  "hypothesis", "reference"]
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+            w.writeheader()
+            for lbl in labels_present:
+                for entry in all_results[lbl]:
+                    w.writerow({"label": lbl, **entry})
+        print(f"\n  Saved: {path}")
+
+    # ------------------------------------------------------------------ #
+    # Plots                                                                #
+    # ------------------------------------------------------------------ #
+    if do_plot:
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            print("  [plot] matplotlib not available – skipping plots.")
+        else:
+            out_dir = save_dir or "results_correctness"
+            os.makedirs(out_dir, exist_ok=True)
+            colors = {"scratch": "gray", "example": "coral", "template": "steelblue"}
+            x = list(range(len(utterances)))
+
+            # Per-utterance WER
+            fig, ax = plt.subplots(figsize=(max(8, len(x)), 4))
+            width = 0.25
+            plot_labels = [l for l in labels_present if all_results.get(l)]
+            for i, lbl in enumerate(plot_labels):
+                wers = [e["wer"] for e in all_results[lbl]]
+                offsets = [xi + (i - len(plot_labels) / 2) * width for xi in x]
+                ax.bar(offsets, wers, width=width, label=lbl, color=colors.get(lbl))
+            ax.set_xlabel("Utterance index"); ax.set_ylabel("WER")
+            ax.set_title("Per-utterance WER"); ax.legend(); ax.grid(axis="y")
+            ax.set_xticks(x)
+            path = os.path.join(out_dir, "correctness_wer_per_utterance.png")
+            fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
+            print(f"  Plot saved: {path}")
+
+            # Summary bar: mean WER / CER per model
+            sum_labels = [l for l in labels_present if all_results.get(l)]
+            fig, axes = plt.subplots(1, 2, figsize=(8, 4))
+            for ax, metric, title in zip(axes, ["wer", "cer"], ["Mean WER", "Mean CER"]):
+                means = [float(np.mean([e[metric] for e in all_results[lbl]]))
+                         for lbl in sum_labels]
+                bars = ax.bar(sum_labels, means,
+                              color=[colors.get(l, "silver") for l in sum_labels])
+                ax.set_ylabel(title); ax.set_title(title); ax.grid(axis="y")
+                for bar, val in zip(bars, means):
+                    ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.005,
+                            f"{val:.3f}", ha="center", va="bottom", fontsize=9)
+            fig.tight_layout()
+            path = os.path.join(out_dir, "correctness_summary.png")
+            fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
+            print(f"  Plot saved: {path}")
+
+
+def benchmark_model_sweep(
+    data_dir: str = None,
+    target_gen_lens: List[int] = None,
+    warmup: int = 2,
+    runs: int = 5,
+    save_dir: str = None,
+    do_plot: bool = False,
+):
+    """Decoder context-length scaling benchmark.
+
+    Fixes one audio input and sweeps max_new_tokens to show how latency and
+    throughput scale with decoder sequence length.  Compares template vs example.
+    """
+    if target_gen_lens is None:
+        target_gen_lens = [10, 25, 50, 100, 200, 400]
+    if data_dir is None:
+        data_dir = _LIBRISPEECH_DATA_DIR
+
+    print("\n" + "=" * 72)
+    print("PERFORMANCE SWEEP: template vs example  (decoder context scaling)")
+    print(f"  gen_lens      = {target_gen_lens}")
+    print(f"  warmup/runs   = {warmup}/{runs}")
+    print("=" * 72)
+
+    device = _device()
+
+    # Load enough audio to fill the 30s processor window (20s of real audio suffices)
+    max_samples_needed = 20 * 16000 + 16000
+    audio_full, _segments = _load_librispeech_samples(data_dir, max_samples_needed)
+    n_fixed = min(20 * 16000, len(audio_full))
+    audio_clip = audio_full[:n_fixed]
+
+    all_results: Dict[str, List[dict]] = {}
+
+    for folder, label in [(_TEMPLATE_DIR, "template"), (_EXAMPLE_DIR, "example")]:
+        print(f"\n[{label}] Loading model from {os.path.basename(folder)}...")
+        _model_load(folder)
+
+        try:
+            from weight_loader import load_model_from_hf
+            model, processor = load_model_from_hf("zai-org/GLM-ASR-Nano-2512")
+            generate_fn = getattr(model, "generate_v8b",
+                          getattr(model, "generate_v8",
+                          getattr(model, "generate_v6", model.generate)))
+
+            # Fixed inputs — prepared once outside the gen_len loop
+            input_features, input_ids, mask = _prepare_inputs(processor, audio_clip, device)
+            actual_ctx_len = int((input_features.shape[-1] // 2) // 4)
+            reference_text = _get_reference(_segments, n_fixed)
+            print(f"  Fixed audio: {n_fixed/16000:.1f}s | encoder ctx: {actual_ctx_len} tokens")
+
             label_results: List[dict] = []
 
-            for seq_len in target_seq_lens:
-                n_samp = _n_samples(seq_len)
-                audio_clip = audio_full[:n_samp]
-                duration = n_samp / 16000
-
-                input_features, input_ids, mask = _prepare_inputs(processor, audio_clip, device)
-
-                # Actual audio tokens in this batch (may differ slightly from seq_len)
-                actual_seq_len = int((input_features.shape[-1] // 2) // 4)
-
-                def _call():
+            for gen_len in target_gen_lens:
+                def _call(gen_len=gen_len):
                     kw = dict(input_features=input_features,
                               input_ids=input_ids,
-                              max_new_tokens=max_new_tokens,
+                              max_new_tokens=gen_len,
                               temperature=1.0, top_k=1)
                     if mask is not None:
                         kw["input_features_mask"] = mask
@@ -2223,46 +2449,43 @@ def benchmark_model_sweep(
                         kw.pop("input_features_mask", None)
                         return generate_fn(**kw)
 
-                print(f"  seq_len={seq_len:4d} (actual={actual_seq_len:4d})  "
-                      f"audio={duration:.1f}s  warming up...", end="", flush=True)
+                print(f"  gen_len={gen_len:4d}  warming up...", end="", flush=True)
                 for _ in range(warmup):
                     output = _call()
 
-                # Decode last warmup output and compare with reference transcript
-                reference_text = _get_reference(_segments, n_samp)
                 hypothesis_text = _decode_output(output, input_ids.shape[-1], processor) \
                     if hasattr(output, "shape") else ""
                 wer, cer = _wer_cer(hypothesis_text, reference_text)
 
                 if torch.cuda.is_available():
                     torch.cuda.reset_peak_memory_stats()
-
                 times = timed_run(_call, warmup=0, runs=runs)
                 peak_mem = (torch.cuda.max_memory_allocated() / 1024**2
                             if torch.cuda.is_available() else float("nan"))
 
-                n_gen = output.shape[-1] - input_ids.shape[-1] if hasattr(output, "shape") else max_new_tokens
-                mean_ms = float(np.mean(times))
-                tok_per_sec = n_gen / (mean_ms / 1000.0) if mean_ms > 0 else float("nan")
+                mean_ms    = float(np.mean(times))
+                tok_per_sec = gen_len / (mean_ms / 1000.0) if mean_ms > 0 else float("nan")
+                ms_per_tok  = mean_ms / gen_len if gen_len > 0 else float("nan")
 
-                print(f"  {mean_ms:.1f}ms  {tok_per_sec:.1f}tok/s  {peak_mem:.0f}MB")
-                print(f"    ref : {reference_text[:120]}")
-                print(f"    hyp : {hypothesis_text[:120]}")
+                print(f"  {mean_ms:.1f}ms  {tok_per_sec:.1f}tok/s  {ms_per_tok:.2f}ms/tok  {peak_mem:.0f}MB")
+                _show = lambda s, n=200: s[:n] + "..." if len(s) > n else s
+                print(f"    hyp ({len(hypothesis_text.split()):3d} words): {_show(hypothesis_text)}")
                 print(f"    WER={wer:.3f}  CER={cer:.3f}")
+
                 label_results.append({
-                    "seq_len":        seq_len,
-                    "actual_seq_len": actual_seq_len,
-                    "mean":           mean_ms,
-                    "std":            float(np.std(times)),
-                    "min":            float(np.min(times)),
-                    "max":            float(np.max(times)),
-                    "tok_per_sec":    tok_per_sec,
-                    "peak_mem_mb":    peak_mem,
-                    "n_generated":    n_gen,
-                    "wer":            wer,
-                    "cer":            cer,
-                    "hypothesis":     hypothesis_text,
-                    "reference":      reference_text,
+                    "gen_len":     gen_len,
+                    "mean":        mean_ms,
+                    "std":         float(np.std(times)),
+                    "min":         float(np.min(times)),
+                    "max":         float(np.max(times)),
+                    "tok_per_sec": tok_per_sec,
+                    "ms_per_tok":  ms_per_tok,
+                    "peak_mem_mb": peak_mem,
+                    "n_generated": gen_len,
+                    "wer":         wer,
+                    "cer":         cer,
+                    "hypothesis":  hypothesis_text,
+                    "reference":   reference_text,
                 })
 
             all_results[label] = label_results
@@ -2271,21 +2494,12 @@ def benchmark_model_sweep(
             print(f"  ERROR in {label}: {e}")
             import traceback; traceback.print_exc()
         finally:
-            if folder in sys.path:
-                sys.path.remove(folder)
             try:
                 del model
                 del processor
             except Exception:
                 pass
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            gc.collect()
-            for mod_name in list(sys.modules.keys()):
-                if mod_name in ["weight_loader", "model", "layers", "attention",
-                                "flash", "rope", "conv"]:
-                    del sys.modules[mod_name]
+            _model_unload(folder)
 
     # ------------------------------------------------------------------ #
     # Summary table                                                        #
@@ -2296,11 +2510,8 @@ def benchmark_model_sweep(
 
     col_w = 13
 
-    def _hdr(name):
-        return f"{name:>{col_w}s}"
-
-    def _val(v, fmt=".1f"):
-        return f"{v:{col_w}{fmt}}" if not math.isnan(v) else f"{'N/A':>{col_w}s}"
+    def _hdr(name): return f"{name:>{col_w}s}"
+    def _val(v, fmt=".1f"): return f"{v:{col_w}{fmt}}" if not math.isnan(v) else f"{'N/A':>{col_w}s}"
 
     has_both = len(labels_present) == 2
 
@@ -2309,70 +2520,67 @@ def benchmark_model_sweep(
     print("=" * 72)
 
     for metric_key, metric_label, fmt in [
-        ("mean",        "Mean latency (ms)",  ".1f"),
-        ("tok_per_sec", "Throughput (tok/s)", ".1f"),
-        ("peak_mem_mb", "Peak GPU mem (MB)",  ".0f"),
-        ("wer",         "WER",                ".3f"),
-        ("cer",         "CER",                ".3f"),
+        ("mean",        "Mean latency (ms)",      ".1f"),
+        ("tok_per_sec", "Throughput (tok/s)",      ".1f"),
+        ("ms_per_tok",  "Latency/token (ms/tok)", ".2f"),
+        ("peak_mem_mb", "Peak GPU mem (MB)",       ".0f"),
+        ("wer",         "WER",                     ".3f"),
+        ("cer",         "CER",                     ".3f"),
     ]:
         print(f"\n{metric_label}")
-        hdr = f"{'seq_len':>10s}" + "".join(_hdr(l) for l in labels_present)
+        hdr = f"{'gen_len':>10s}" + "".join(_hdr(l) for l in labels_present)
         if has_both:
             hdr += _hdr("speedup")
-        print(hdr)
-        print("-" * len(hdr))
+        print(hdr); print("-" * len(hdr))
 
-        rows_by_seq: Dict[int, Dict[str, float]] = {}
+        rows_by_gl: Dict[int, Dict[str, float]] = {}
         for lbl in labels_present:
             for entry in all_results[lbl]:
-                sl = entry["seq_len"]
-                rows_by_seq.setdefault(sl, {})[lbl] = entry.get(metric_key, float("nan"))
+                gl = entry["gen_len"]
+                rows_by_gl.setdefault(gl, {})[lbl] = entry.get(metric_key, float("nan"))
 
-        for sl in sorted(rows_by_seq):
-            row = f"{sl:>10d}"
-            vals = [rows_by_seq[sl].get(l, float("nan")) for l in labels_present]
+        for gl in sorted(rows_by_gl):
+            row = f"{gl:>10d}"
+            vals = [rows_by_gl[gl].get(l, float("nan")) for l in labels_present]
             row += "".join(_val(v, fmt) for v in vals)
             if has_both and not any(math.isnan(v) for v in vals) and vals[0] > 0:
-                # speedup = example/template for latency (>1 means template faster)
-                # speedup = template/example for throughput (>1 means template faster)
-                if metric_key in ("mean",):
+                # For latency metrics: lower is better → speedup = example / template
+                # For throughput: higher is better → speedup = template / example
+                if metric_key in ("mean", "ms_per_tok"):
                     spd = vals[1] / vals[0]
-                else:
+                elif metric_key in ("tok_per_sec",):
                     spd = vals[0] / vals[1]
-                row += f"{spd:{col_w}.2f}x"
+                else:
+                    spd = float("nan")  # WER/CER: no meaningful speedup ratio
+                if not math.isnan(spd):
+                    row += f"{spd:{col_w}.2f}x"
             print(row)
 
     print(f"\n{'─'*72}")
     print("Note: speedup > 1x means template is faster than example.")
 
-    # ------------------------------------------------------------------ #
-    # Correctness check: template vs example hypothesis match              #
-    # ------------------------------------------------------------------ #
+    # Output-match check
     if has_both:
-        print("\nCorrectness check (template vs example output match):")
-        t_entries = {e["seq_len"]: e for e in all_results["template"]}
-        e_entries = {e["seq_len"]: e for e in all_results["example"]}
-        for sl in sorted(t_entries):
-            if sl not in e_entries:
-                continue
-            t_hyp = t_entries[sl].get("hypothesis", "")
-            e_hyp = e_entries[sl].get("hypothesis", "")
-            match = "MATCH" if t_hyp.strip() == e_hyp.strip() else "DIFFER"
-            print(f"  seq_len={sl:4d}: {match}")
+        print("\nOutput match check (template vs example):")
+        t_map = {e["gen_len"]: e.get("hypothesis", "") for e in all_results["template"]}
+        e_map = {e["gen_len"]: e.get("hypothesis", "") for e in all_results["example"]}
+        for gl in sorted(t_map):
+            match = "MATCH" if t_map[gl].strip() == e_map.get(gl, "").strip() else "DIFFER"
+            print(f"  gen_len={gl:4d}: {match}")
             if match == "DIFFER":
-                print(f"    template: {t_hyp[:100]}")
-                print(f"    example : {e_hyp[:100]}")
+                print(f"    template: {t_map[gl][:100]}")
+                print(f"    example : {e_map.get(gl, '')[:100]}")
 
     # ------------------------------------------------------------------ #
-    # CSV logging                                                          #
+    # CSV                                                                  #
     # ------------------------------------------------------------------ #
     if save_dir:
         import csv
         os.makedirs(save_dir, exist_ok=True)
         path = os.path.join(save_dir, "sweep_results.csv")
-        fields = ["label", "seq_len", "actual_seq_len", "mean", "std", "min", "max",
-                  "tok_per_sec", "peak_mem_mb", "n_generated", "wer", "cer",
-                  "hypothesis", "reference"]
+        fields = ["label", "gen_len", "mean", "std", "min", "max",
+                  "tok_per_sec", "ms_per_tok", "peak_mem_mb", "n_generated",
+                  "wer", "cer", "hypothesis", "reference"]
         with open(path, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
             w.writeheader()
@@ -2394,24 +2602,23 @@ def benchmark_model_sweep(
             os.makedirs(out_dir, exist_ok=True)
             colors = {"template": "steelblue", "example": "coral"}
             for metric, ylabel, fname in [
-                ("mean",        "Latency (ms)",       "latency"),
-                ("tok_per_sec", "Throughput (tok/s)", "throughput"),
-                ("wer",         "WER",                "wer"),
-                ("cer",         "CER",                "cer"),
+                ("mean",        "Latency (ms)",          "latency"),
+                ("tok_per_sec", "Throughput (tok/s)",     "throughput"),
+                ("ms_per_tok",  "Latency/token (ms/tok)", "ms_per_tok"),
+                ("wer",         "WER",                    "wer"),
+                ("cer",         "CER",                    "cer"),
             ]:
                 fig, ax = plt.subplots(figsize=(7, 4))
                 for lbl in labels_present:
-                    xs = [e["seq_len"] for e in all_results[lbl]]
+                    xs = [e["gen_len"] for e in all_results[lbl]]
                     ys = [e.get(metric, float("nan")) for e in all_results[lbl]]
                     ax.plot(xs, ys, marker="o", label=lbl, color=colors.get(lbl))
-                ax.set_xlabel("seq_len (audio tokens)")
+                ax.set_xlabel("max_new_tokens (decoder context)")
                 ax.set_ylabel(ylabel)
-                ax.set_title(f"Model Sweep – {ylabel}")
-                ax.legend()
-                ax.grid(True)
+                ax.set_title(f"Performance Sweep – {ylabel}")
+                ax.legend(); ax.grid(True)
                 path = os.path.join(out_dir, f"sweep_{fname}.png")
-                fig.savefig(path, dpi=150, bbox_inches="tight")
-                plt.close(fig)
+                fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
                 print(f"  Plot saved: {path}")
 
 
@@ -2477,17 +2684,28 @@ def main():
     if torch.cuda.is_available():
         print(f"GPU:    {torch.cuda.get_device_name(0)}")
 
-    # -- Model sweep benchmark (seq-len scaling) --
+    # -- Correctness E2E (WER/CER on real utterances) --
+    if args.kernel.strip() == "model_correctness":
+        n_utt = int(args.seq_lens) if args.seq_lens and args.seq_lens.isdigit() else 15
+        benchmark_model_correctness(
+            data_dir=os.path.join(_SCRIPT_DIR, "data"),
+            n_utterances=n_utt,
+            max_new_tokens=args.max_new_tokens,
+            save_dir=args.save,
+            do_plot=args.plot,
+        )
+        return
+
+    # -- Performance E2E sweep (decoder context scaling) --
     if args.kernel.strip() == "model_sweep":
         runs = args.runs if args.runs != 20 else 5
-        seq_lens = ([int(x) for x in args.seq_lens.split(",")]
+        gen_lens = ([int(x) for x in args.seq_lens.split(",")]
                     if args.seq_lens else None)
         benchmark_model_sweep(
             data_dir=os.path.join(_SCRIPT_DIR, "data"),
-            target_seq_lens=seq_lens,
+            target_gen_lens=gen_lens,
             warmup=args.warmup,
             runs=runs,
-            max_new_tokens=args.max_new_tokens,
             save_dir=args.save,
             do_plot=args.plot,
         )
