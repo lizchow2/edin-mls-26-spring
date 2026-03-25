@@ -115,6 +115,40 @@ def check_output(name: str, out: torch.Tensor, ref: torch.Tensor,
     return ok
 
 
+def _edit_distance(a, b):
+    """Levenshtein distance between two sequences (words or chars)."""
+    m, n = len(a), len(b)
+    dp = list(range(n + 1))
+    for i in range(1, m + 1):
+        prev, dp[0] = dp[0], i
+        for j in range(1, n + 1):
+            prev, dp[j] = dp[j], prev if a[i - 1] == b[j - 1] else 1 + min(prev, dp[j], dp[j - 1])
+    return dp[n]
+
+
+def _wer_cer(hypothesis: str, reference: str):
+    """Return (wer, cer) as floats. Both inputs normalised to lowercase/stripped."""
+    hyp = hypothesis.lower().strip()
+    ref = reference.lower().strip()
+    ref_words, hyp_words = ref.split(), hyp.split()
+    ref_chars, hyp_chars = list(ref), list(hyp)
+    wer = _edit_distance(hyp_words, ref_words) / max(len(ref_words), 1)
+    cer = _edit_distance(hyp_chars, ref_chars) / max(len(ref_chars), 1)
+    return wer, cer
+
+
+def _decode_output(output_ids, input_ids_len: int, processor) -> str:
+    """Decode only the newly generated tokens from a generate() output tensor."""
+    gen = output_ids[0, input_ids_len:].tolist()
+    try:
+        return processor.tokenizer.decode(gen, skip_special_tokens=True)
+    except Exception:
+        try:
+            return processor.decode(gen, skip_special_tokens=True)
+        except Exception:
+            return str(gen)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -2020,18 +2054,21 @@ _LIBRISPEECH_DATA_DIR = os.path.join(_SCRIPT_DIR, "data")
 _SAMPLES_PER_TOKEN = 1280
 
 
-def _load_librispeech_audio(data_dir: str, max_samples_needed: int) -> np.ndarray:
-    """Return a mono float32 array @ 16 kHz from LibriSpeech test-clean.
+def _load_librispeech_samples(data_dir: str, max_samples_needed: int):
+    """Return (audio_full, segments) from LibriSpeech test-clean.
 
-    Concatenates samples until we have enough for *max_samples_needed*, then
-    returns the full concatenation (callers truncate as desired).  Falls back
-    to synthetic silence if torchaudio is unavailable.
+    audio_full : mono float32 array @ 16 kHz (concatenation of utterances)
+    segments   : list of (end_sample_idx, transcript_text) — one entry per
+                 utterance, where end_sample_idx is the cumulative sample count
+                 after that utterance.  Callers use this to find the reference
+                 transcript for any given audio clip length.
+    Falls back to synthetic silence + empty segments if torchaudio unavailable.
     """
     try:
         import torchaudio  # type: ignore
     except ImportError:
         print("  [sweep] torchaudio not found – using synthetic silence.")
-        return np.zeros(max_samples_needed, dtype=np.float32)
+        return np.zeros(max_samples_needed, dtype=np.float32), []
 
     os.makedirs(data_dir, exist_ok=True)
     print(f"  [sweep] Downloading / loading LibriSpeech test-clean → {data_dir}")
@@ -2039,12 +2076,13 @@ def _load_librispeech_audio(data_dir: str, max_samples_needed: int) -> np.ndarra
         dataset = torchaudio.datasets.LIBRISPEECH(data_dir, url="test-clean", download=True)
     except Exception as e:
         print(f"  [sweep] LibriSpeech load failed ({e}) – using synthetic silence.")
-        return np.zeros(max_samples_needed, dtype=np.float32)
+        return np.zeros(max_samples_needed, dtype=np.float32), []
 
     chunks: List[np.ndarray] = []
+    segments = []   # (cumulative_end_sample, transcript)
     total = 0
     for idx in range(min(len(dataset), 30)):          # scan up to 30 samples
-        waveform, sr, *_ = dataset[idx]
+        waveform, sr, utterance, *_ = dataset[idx]
         arr = waveform.squeeze(0).numpy().astype(np.float32)
         if sr != 16000:
             try:
@@ -2055,18 +2093,29 @@ def _load_librispeech_audio(data_dir: str, max_samples_needed: int) -> np.ndarra
                 arr = sp_resample(arr, int(len(arr) * 16000 / sr)).astype(np.float32)
         chunks.append(arr)
         total += len(arr)
+        segments.append((total, utterance.strip()))
         if total >= max_samples_needed:
             break
 
     if not chunks:
-        return np.zeros(max_samples_needed, dtype=np.float32)
+        return np.zeros(max_samples_needed, dtype=np.float32), []
 
     audio = np.concatenate(chunks)
     if len(audio) < max_samples_needed:
         # Pad with silence so all requested seq_lens are reachable
         audio = np.concatenate([audio, np.zeros(max_samples_needed - len(audio), dtype=np.float32)])
-    print(f"  [sweep] Audio ready: {len(audio)/16000:.1f}s ({len(audio)} samples)")
-    return audio
+    print(f"  [sweep] Audio ready: {len(audio)/16000:.1f}s ({len(audio)} samples), "
+          f"{len(segments)} utterances")
+    return audio, segments
+
+
+def _get_reference(segments, n_samp: int) -> str:
+    """Return the concatenated transcript for utterances fully covered by n_samp."""
+    parts = [t for (end, t) in segments if end <= n_samp]
+    # Fall back to the first utterance if none fall fully within the clip
+    if not parts and segments:
+        parts = [segments[0][1]]
+    return " ".join(parts)
 
 
 def _prepare_inputs(processor, audio: np.ndarray, device: torch.device):
@@ -2097,6 +2146,8 @@ def benchmark_model_sweep(
     warmup: int = 2,
     runs: int = 5,
     max_new_tokens: int = 10,
+    save_dir: str = None,
+    do_plot: bool = False,
 ):
     """Sweep the full model over multiple audio sequence lengths using LibriSpeech.
 
@@ -2121,7 +2172,7 @@ def benchmark_model_sweep(
     max_seq_len = max(target_seq_lens)
     max_samples_needed = max_seq_len * _SAMPLES_PER_TOKEN + 16000  # +1s headroom
 
-    audio_full = _load_librispeech_audio(data_dir, max_samples_needed)
+    audio_full, _segments = _load_librispeech_samples(data_dir, max_samples_needed)
 
     # Map seq_len → sample count, capped to available audio length
     def _n_samples(seq_len: int) -> int:
@@ -2177,6 +2228,12 @@ def benchmark_model_sweep(
                 for _ in range(warmup):
                     output = _call()
 
+                # Decode last warmup output and compare with reference transcript
+                reference_text = _get_reference(_segments, n_samp)
+                hypothesis_text = _decode_output(output, input_ids.shape[-1], processor) \
+                    if hasattr(output, "shape") else ""
+                wer, cer = _wer_cer(hypothesis_text, reference_text)
+
                 if torch.cuda.is_available():
                     torch.cuda.reset_peak_memory_stats()
 
@@ -2189,16 +2246,23 @@ def benchmark_model_sweep(
                 tok_per_sec = n_gen / (mean_ms / 1000.0) if mean_ms > 0 else float("nan")
 
                 print(f"  {mean_ms:.1f}ms  {tok_per_sec:.1f}tok/s  {peak_mem:.0f}MB")
+                print(f"    ref : {reference_text[:120]}")
+                print(f"    hyp : {hypothesis_text[:120]}")
+                print(f"    WER={wer:.3f}  CER={cer:.3f}")
                 label_results.append({
-                    "seq_len":       seq_len,
+                    "seq_len":        seq_len,
                     "actual_seq_len": actual_seq_len,
-                    "mean":          mean_ms,
-                    "std":           float(np.std(times)),
-                    "min":           float(np.min(times)),
-                    "max":           float(np.max(times)),
-                    "tok_per_sec":   tok_per_sec,
-                    "peak_mem_mb":   peak_mem,
-                    "n_generated":   n_gen,
+                    "mean":           mean_ms,
+                    "std":            float(np.std(times)),
+                    "min":            float(np.min(times)),
+                    "max":            float(np.max(times)),
+                    "tok_per_sec":    tok_per_sec,
+                    "peak_mem_mb":    peak_mem,
+                    "n_generated":    n_gen,
+                    "wer":            wer,
+                    "cer":            cer,
+                    "hypothesis":     hypothesis_text,
+                    "reference":      reference_text,
                 })
 
             all_results[label] = label_results
@@ -2248,6 +2312,8 @@ def benchmark_model_sweep(
         ("mean",        "Mean latency (ms)",  ".1f"),
         ("tok_per_sec", "Throughput (tok/s)", ".1f"),
         ("peak_mem_mb", "Peak GPU mem (MB)",  ".0f"),
+        ("wer",         "WER",                ".3f"),
+        ("cer",         "CER",                ".3f"),
     ]:
         print(f"\n{metric_label}")
         hdr = f"{'seq_len':>10s}" + "".join(_hdr(l) for l in labels_present)
@@ -2278,6 +2344,75 @@ def benchmark_model_sweep(
 
     print(f"\n{'─'*72}")
     print("Note: speedup > 1x means template is faster than example.")
+
+    # ------------------------------------------------------------------ #
+    # Correctness check: template vs example hypothesis match              #
+    # ------------------------------------------------------------------ #
+    if has_both:
+        print("\nCorrectness check (template vs example output match):")
+        t_entries = {e["seq_len"]: e for e in all_results["template"]}
+        e_entries = {e["seq_len"]: e for e in all_results["example"]}
+        for sl in sorted(t_entries):
+            if sl not in e_entries:
+                continue
+            t_hyp = t_entries[sl].get("hypothesis", "")
+            e_hyp = e_entries[sl].get("hypothesis", "")
+            match = "MATCH" if t_hyp.strip() == e_hyp.strip() else "DIFFER"
+            print(f"  seq_len={sl:4d}: {match}")
+            if match == "DIFFER":
+                print(f"    template: {t_hyp[:100]}")
+                print(f"    example : {e_hyp[:100]}")
+
+    # ------------------------------------------------------------------ #
+    # CSV logging                                                          #
+    # ------------------------------------------------------------------ #
+    if save_dir:
+        import csv
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.join(save_dir, "sweep_results.csv")
+        fields = ["label", "seq_len", "actual_seq_len", "mean", "std", "min", "max",
+                  "tok_per_sec", "peak_mem_mb", "n_generated", "wer", "cer",
+                  "hypothesis", "reference"]
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+            w.writeheader()
+            for lbl in labels_present:
+                for entry in all_results[lbl]:
+                    w.writerow({"label": lbl, **entry})
+        print(f"\n  Saved: {path}")
+
+    # ------------------------------------------------------------------ #
+    # Plots                                                                #
+    # ------------------------------------------------------------------ #
+    if do_plot:
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            print("  [plot] matplotlib not available – skipping plots.")
+        else:
+            out_dir = save_dir or "results_sweep"
+            os.makedirs(out_dir, exist_ok=True)
+            colors = {"template": "steelblue", "example": "coral"}
+            for metric, ylabel, fname in [
+                ("mean",        "Latency (ms)",       "latency"),
+                ("tok_per_sec", "Throughput (tok/s)", "throughput"),
+                ("wer",         "WER",                "wer"),
+                ("cer",         "CER",                "cer"),
+            ]:
+                fig, ax = plt.subplots(figsize=(7, 4))
+                for lbl in labels_present:
+                    xs = [e["seq_len"] for e in all_results[lbl]]
+                    ys = [e.get(metric, float("nan")) for e in all_results[lbl]]
+                    ax.plot(xs, ys, marker="o", label=lbl, color=colors.get(lbl))
+                ax.set_xlabel("seq_len (audio tokens)")
+                ax.set_ylabel(ylabel)
+                ax.set_title(f"Model Sweep – {ylabel}")
+                ax.legend()
+                ax.grid(True)
+                path = os.path.join(out_dir, f"sweep_{fname}.png")
+                fig.savefig(path, dpi=150, bbox_inches="tight")
+                plt.close(fig)
+                print(f"  Plot saved: {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -2353,6 +2488,8 @@ def main():
             warmup=args.warmup,
             runs=runs,
             max_new_tokens=args.max_new_tokens,
+            save_dir=args.save,
+            do_plot=args.plot,
         )
         return
 
