@@ -99,7 +99,7 @@ trap 'on_exit' EXIT
 # ---------------------------------------------------------------------------
 
 cd "$PROJECT_DIR"
-
+conda init
 conda activate mls
 
 else
