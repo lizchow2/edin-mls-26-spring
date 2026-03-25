@@ -8,7 +8,7 @@
 #SBATCH --mem=16G
 #SBATCH --time=04:00:00
 
-set -Eeuo pipefail
+set -Eeo pipefail   # no -u: conda init sets unbound vars in the environment
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -17,6 +17,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ---------------------------------------------------------------------------
 
 PROJECT_DIR=${PROJECT_DIR:-/home/$USER/projects/edin-mls-26-spring}
+HW1_DIR=${HW1_DIR:-$PROJECT_DIR/hw1-asr}
 
 # Kernel microbenchmark settings
 RUNS=${RUNS:-100}
@@ -97,7 +98,7 @@ trap 'on_exit' EXIT
 # Environment
 # ---------------------------------------------------------------------------
 
-cd "$PROJECT_DIR"
+cd "$HW1_DIR"
 
 # Activate conda env in a non-interactive shell
 CONDA_BASE=$(conda info --base 2>/dev/null || echo "")
@@ -147,7 +148,7 @@ run_kernel() {
   local block_sizes=$2
   log "-- Kernel: $kernel (block-sizes: ${block_sizes:-<default>})"
   if [ -n "$block_sizes" ]; then
-    python "$PROJECT_DIR/benchmark_kernels.py" \
+    python "$HW1_DIR/benchmark_kernels.py" \
       --kernel "$kernel" \
       --seq-lens "$SEQ_LENS_KERNEL" \
       --block-sizes "$block_sizes" \
@@ -157,7 +158,7 @@ run_kernel() {
       --plot \
       --check
   else
-    python "$PROJECT_DIR/benchmark_kernels.py" \
+    python "$HW1_DIR/benchmark_kernels.py" \
       --kernel "$kernel" \
       --seq-lens "$SEQ_LENS_KERNEL" \
       --runs "$RUNS" \
@@ -200,7 +201,7 @@ log "==== PHASE 1 complete. CSVs and quick plots in $OUTPUT_DIR/kernels ===="
 
 log "==== PHASE 2: Model benchmark (audio=$AUDIO, runs=$MODEL_RUNS) ===="
 
-python "$PROJECT_DIR/benchmark_kernels.py" \
+python "$HW1_DIR/benchmark_kernels.py" \
   --kernel model \
   --audio "$AUDIO" \
   --runs "$MODEL_RUNS" \
@@ -216,7 +217,7 @@ log "==== PHASE 2 complete ===="
 
 log "==== PHASE 3: Model sweep (seq-lens=$MODEL_SWEEP_SEQ_LENS, runs=$MODEL_RUNS) ===="
 
-python "$PROJECT_DIR/benchmark_kernels.py" \
+python "$HW1_DIR/benchmark_kernels.py" \
   --kernel model_sweep \
   --seq-lens "$MODEL_SWEEP_SEQ_LENS" \
   --runs "$MODEL_RUNS" \
@@ -232,7 +233,7 @@ log "==== PHASE 3 complete. Sweep CSV + PNGs in $OUTPUT_DIR/model_sweep ===="
 
 log "==== PHASE 4: Model correctness (utterances=$MODEL_CORRECTNESS_UTTERANCES) ===="
 
-python "$PROJECT_DIR/benchmark_kernels.py" \
+python "$HW1_DIR/benchmark_kernels.py" \
   --kernel model_correctness \
   --seq-lens "$MODEL_CORRECTNESS_UTTERANCES" \
   --max-new-tokens 200 \
@@ -247,7 +248,7 @@ log "==== PHASE 4 complete. Correctness CSV + PNGs in $OUTPUT_DIR/model_correctn
 
 log "==== PHASE 5: plot_report.py — generating 4-panel reports ===="
 
-python "$PROJECT_DIR/plot_report.py" "$OUTPUT_DIR/kernels" --dpi 150
+python "$HW1_DIR/plot_report.py" "$OUTPUT_DIR/kernels" --dpi 150
 
 # Copy combined report PNGs to dedicated reports/ folder for easy access
 find "$OUTPUT_DIR/kernels" -name "*_report.png" -exec cp {} "$OUTPUT_DIR/reports/" \;
