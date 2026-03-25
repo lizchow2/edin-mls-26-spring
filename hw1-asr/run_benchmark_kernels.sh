@@ -5,7 +5,7 @@
 #SBATCH --partition=Teaching
 #SBATCH --gres=gpu:1g.18gb:1
 #SBATCH --cpus-per-task=2
-#SBATCH --mem=16G
+#SBATCH --mem=32G
 #SBATCH --time=04:00:00
 
 set -Eeo pipefail   # no -u: conda init sets unbound vars in the environment
