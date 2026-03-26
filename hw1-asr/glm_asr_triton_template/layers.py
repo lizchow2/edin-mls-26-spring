@@ -386,14 +386,14 @@ def linear_kernel_tf32(
         a = tl.load(a_ptr + a_offsets, mask=mask[None, :], other=0.0)
         b = tl.load(b_ptr + b_offsets, mask=mask[:, None], other=0.0)
 
-        accumulator = tl.dot(a, b, acc=accumulator)
+        accumulator += tl.dot(a, b)
 
         a_offsets += BLOCK_K * stride_ak
         b_offsets += BLOCK_K * stride_bk
 
     c_offsets = offsets_M[:, None] * stride_cm + offsets_N[None, :] * stride_cn
     c_mask = (offsets_M[:, None] < M) & (offsets_N[None, :] < N)
-    
+
     tl.store(c_ptr + c_offsets, accumulator, mask=c_mask)
 
 @triton.jit
@@ -549,7 +549,7 @@ def linear_gelu_kernel(
         a = tl.load(a_ptr + a_offsets, mask=mask[None, :], other=0.0)
         b = tl.load(b_ptr + b_offsets, mask=mask[:, None], other=0.0)
 
-        accumulator = tl.dot(a, b, acc=accumulator)
+        accumulator += tl.dot(a, b)
 
         a_offsets += BLOCK_K * stride_ak
         b_offsets += BLOCK_K * stride_bk
@@ -622,8 +622,8 @@ def swiglu_fused_kernel(
         gate_w = tl.load(gate_ptr + gate_offsets, mask=mask[:, None], other=0.0)
         up_w = tl.load(up_ptr + up_offsets, mask=mask[:, None], other=0.0)
 
-        gate_acc = tl.dot(a, gate_w, acc=gate_acc)
-        up_acc = tl.dot(a, up_w, acc=up_acc)
+        gate_acc += tl.dot(a, gate_w)
+        up_acc += tl.dot(a, up_w)
 
         a_offsets += BLOCK_K * stride_ak
         gate_offsets += BLOCK_K * stride_gk
