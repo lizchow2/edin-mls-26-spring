@@ -22,14 +22,14 @@ def _flash_shm_budget() -> int:
 def _make_flash_configs(shm_budget: int, block_d: int = 128):
     """Generate valid flash attention autotune configs filtered by shared memory constraint."""
     candidates = [
-    triton.Config({'BLOCK_M': 16, 'BLOCK_N': 16}, num_warps=2, num_stages=2),
-    triton.Config({'BLOCK_M': 16, 'BLOCK_N': 32}, num_warps=4, num_stages=2),
-    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 16}, num_warps=4, num_stages=2),
-    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32}, num_warps=4, num_stages=2),
-    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_warps=4, num_stages=2),
-    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64}, num_warps=4, num_stages=2),
-    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_warps=8, num_stages=2),
-    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_warps=8, num_stages=2),
+    triton.Config({'BLOCK_M': 16, 'BLOCK_N': 16}, num_warps=2, num_stages=1),
+    triton.Config({'BLOCK_M': 16, 'BLOCK_N': 32}, num_warps=4, num_stages=1),
+    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 16}, num_warps=4, num_stages=1),
+    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32}, num_warps=4, num_stages=1),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_warps=4, num_stages=1),
+    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64}, num_warps=4, num_stages=1),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_warps=8, num_stages=1),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_warps=8, num_stages=1),
     ]
     # Each SM needs q_tile (BLOCK_M, BLOCK_D) + acc (BLOCK_M, BLOCK_D) + k/v tile (BLOCK_N, BLOCK_D)
     return [
@@ -200,10 +200,7 @@ def compute_flash_attention_kernel(
         k_tile  = tl.load(k_ptrs, mask=mask_kn & mask_kd, other=0.0)
 
         # Attention scores: (BLOCK_M, BLOCK_N) = q_tile @ k_tile^T
-        # Cast to float32 immediately to break the MMA layout chain — on Hopper
-        # (sm_90) the mma->mma layout conversion needed to feed a second tl.dot
-        # with a result derived from the first tl.dot is not supported.
-        scores = tl.dot(q_tile, tl.trans(k_tile)).to(tl.float32) * scale
+        scores = tl.dot(q_tile, tl.trans(k_tile)) * scale
 
         # Add additive attention mask tile (e.g. padding mask)
         if HAS_MASK:
