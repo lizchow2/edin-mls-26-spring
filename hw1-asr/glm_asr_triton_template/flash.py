@@ -200,7 +200,10 @@ def compute_flash_attention_kernel(
         k_tile  = tl.load(k_ptrs, mask=mask_kn & mask_kd, other=0.0)
 
         # Attention scores: (BLOCK_M, BLOCK_N) = q_tile @ k_tile^T
-        scores = tl.dot(q_tile, tl.trans(k_tile)) * scale
+        # Cast to float32 immediately to break the MMA layout chain — on Hopper
+        # (sm_90) the mma->mma layout conversion needed to feed a second tl.dot
+        # with a result derived from the first tl.dot is not supported.
+        scores = tl.dot(q_tile, tl.trans(k_tile)).to(tl.float32) * scale
 
         # Add additive attention mask tile (e.g. padding mask)
         if HAS_MASK:
