@@ -386,7 +386,7 @@ def linear_kernel_tf32(
         a = tl.load(a_ptr + a_offsets, mask=mask[None, :], other=0.0)
         b = tl.load(b_ptr + b_offsets, mask=mask[:, None], other=0.0)
 
-        accumulator += tl.dot(a, b)
+        accumulator += tl.dot(a.to(tl.float16), b.to(tl.float16))
 
         a_offsets += BLOCK_K * stride_ak
         b_offsets += BLOCK_K * stride_bk
@@ -442,7 +442,7 @@ def linear_kernel_tf16(
             mask=(k + offs_k[:, None] < K) & (offs_n[None, :] < N),
             other=0.0,
         ).to(tl.float32) 
-        acc += tl.dot(a, b)
+        acc += tl.dot(a.to(tl.float16), b.to(tl.float16))
 
     tl.store(
         c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
@@ -487,7 +487,7 @@ def linear_kernel_int8(
             other=0,
         ).to(tl.float32)  # int8 -> float32 on chip
 
-        acc += tl.dot(a, b)
+        acc += tl.dot(a.to(tl.float16), b.to(tl.float16))
 
     # load per-channel scales and dequantize
     scale = tl.load(
@@ -549,7 +549,7 @@ def linear_gelu_kernel(
         a = tl.load(a_ptr + a_offsets, mask=mask[None, :], other=0.0)
         b = tl.load(b_ptr + b_offsets, mask=mask[:, None], other=0.0)
 
-        accumulator += tl.dot(a, b)
+        accumulator += tl.dot(a.to(tl.float16), b.to(tl.float16))
 
         a_offsets += BLOCK_K * stride_ak
         b_offsets += BLOCK_K * stride_bk
@@ -622,8 +622,8 @@ def swiglu_fused_kernel(
         gate_w = tl.load(gate_ptr + gate_offsets, mask=mask[:, None], other=0.0)
         up_w = tl.load(up_ptr + up_offsets, mask=mask[:, None], other=0.0)
 
-        gate_acc += tl.dot(a, gate_w)
-        up_acc += tl.dot(a, up_w)
+        gate_acc += tl.dot(a.to(tl.float16), gate_w.to(tl.float16))
+        up_acc += tl.dot(a.to(tl.float16), up_w.to(tl.float16))
 
         a_offsets += BLOCK_K * stride_ak
         gate_offsets += BLOCK_K * stride_gk
