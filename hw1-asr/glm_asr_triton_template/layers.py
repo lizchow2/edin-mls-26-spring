@@ -53,28 +53,43 @@ _LINEAR_CONFIGS = [
 
 """
 
-_LINEAR_CONFIGS = [
-    # Decode-path (M=1–16): small M tiles, wider N
-    triton.Config({'BLOCK_M': 16,  'BLOCK_N': 32,  'BLOCK_K': 32, 'GROUP_SIZE': 8}, num_warps=2),
-    triton.Config({'BLOCK_M': 16,  'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_SIZE': 8}, num_warps=4),
-    # Mid-range (audio encoder, moderate seq lens)
-    triton.Config({'BLOCK_M': 32,  'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_SIZE': 8}, num_warps=4),
-    triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_SIZE': 8}, num_warps=4),
-    # Larger prefill
-    triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_SIZE': 8}, num_warps=8),
-    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_SIZE': 8}, num_warps=8),
-]
+def _make_linear_configs():
+    # On Hopper (sm_90+) Triton triggers wgmma instructions for BLOCK_M >= 64,
+    # which produces MMA layouts that this Triton version cannot convert, causing
+    # a SIGABRT in Allocation.cpp.  Restrict to BLOCK_M <= 32 on those GPUs.
+    cc = torch.cuda.get_device_capability() if torch.cuda.is_available() else (8, 0)
+    max_block_m = 32 if cc[0] >= 9 else 128
+    candidates = [
+        # Decode-path (M=1–16): small M tiles, wider N
+        triton.Config({'BLOCK_M': 16,  'BLOCK_N': 32,  'BLOCK_K': 32, 'GROUP_SIZE': 8}, num_warps=2),
+        triton.Config({'BLOCK_M': 16,  'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_SIZE': 8}, num_warps=4),
+        # Mid-range (audio encoder, moderate seq lens)
+        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_SIZE': 8}, num_warps=4),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_SIZE': 8}, num_warps=4),
+        # Larger prefill
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_SIZE': 8}, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_SIZE': 8}, num_warps=8),
+    ]
+    return [cfg for cfg in candidates if cfg.kwargs['BLOCK_M'] <= max_block_m]
+
+_LINEAR_CONFIGS = _make_linear_configs()
+
+def _make_linear_int8_configs():
+    cc = torch.cuda.get_device_capability() if torch.cuda.is_available() else (8, 0)
+    max_block_m = 32 if cc[0] >= 9 else 128
+    candidates = [
+        triton.Config({'BLOCK_M': 16,  'BLOCK_N': 32,  'BLOCK_K': 32}, num_warps=2),
+        triton.Config({'BLOCK_M': 16,  'BLOCK_N': 64,  'BLOCK_K': 32}, num_warps=4),
+        triton.Config({'BLOCK_M': 32,  'BLOCK_N': 64,  'BLOCK_K': 32}, num_warps=4),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32}, num_warps=4),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 64}, num_warps=8),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=8),
+    ]
+    return [cfg for cfg in candidates if cfg.kwargs['BLOCK_M'] <= max_block_m]
 
 # Configs for int8 kernel (2D grid, no GROUP_SIZE)
-_LINEAR_INT8_CONFIGS = [
-    triton.Config({'BLOCK_M': 16,  'BLOCK_N': 32,  'BLOCK_K': 32}, num_warps=2),
-    triton.Config({'BLOCK_M': 16,  'BLOCK_N': 64,  'BLOCK_K': 32}, num_warps=4),
-    triton.Config({'BLOCK_M': 32,  'BLOCK_N': 64,  'BLOCK_K': 32}, num_warps=4),
-    triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32}, num_warps=4),
-    triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=8),
-    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 64}, num_warps=8),
-    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=8),
-]
+_LINEAR_INT8_CONFIGS = _make_linear_int8_configs()
 
 # ============================================================================
 # Triton Kernels
