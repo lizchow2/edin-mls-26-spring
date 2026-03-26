@@ -100,18 +100,13 @@ trap 'on_exit' EXIT
 # Environment
 # ---------------------------------------------------------------------------
 
-cd "$HW1_DIR"
+
 
 # Activate conda env in a non-interactive shell
-CONDA_BASE=$(conda info --base 2>/dev/null || echo "")
-if [ -n "$CONDA_BASE" ] && [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
-  source "$CONDA_BASE/etc/profile.d/conda.sh"
-  conda activate mls
-else
-  log "WARNING: conda not found — trying eval shell hook fallback"
-  eval "$(conda shell.bash hook 2>/dev/null)" || true
-  conda activate mls
-fi
+
+source /opt/conda/etc/profile.d/conda.sh
+conda activate mls
+cd "$HW1_DIR"
 
 log "===================================="
 log "HOST:                     $(hostname)"
