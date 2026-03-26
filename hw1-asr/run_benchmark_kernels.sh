@@ -21,7 +21,7 @@ PROJECT_DIR=${PROJECT_DIR:-/home/$USER/projects/edin-mls-26-spring}
 HW1_DIR=${HW1_DIR:-$PROJECT_DIR/hw1-asr}
 
 # Kernel microbenchmark settings
-RUNS=${RUNS:-100}
+RUNS=${RUNS:-1000}
 WARMUP=${WARMUP:-10}
 SEQ_LENS_KERNEL=${SEQ_LENS_KERNEL:-64,128,256,512,1024,2048}
 
@@ -213,7 +213,7 @@ log "==== PHASE 2 complete ===="
 # Phase 3 — Model sweep (latency/throughput/WER/CER vs generation length)
 # ---------------------------------------------------------------------------
 
-log "==== PHASE 3: Model sweep (seq-lens=$MODEL_SWEEP_SEQ_LENS, runs=$MODEL_RUNS) ===="
+log "==== PHASE 3: Model sweep (seq-lens=$MODEL_SWEEP_SEQ_LENS, runs=$MODEL_RUNS, latency speedup saved) ===="
 
 python "$HW1_DIR/benchmark_kernels.py" \
   --kernel model_sweep \
@@ -261,6 +261,7 @@ log "==== PHASE 5 complete. 4-panel reports in $OUTPUT_DIR/reports ===="
 
 log "===================================="
 log "All phases complete."
+log "  model_sweep now also includes sweep_speedup.png"
 log "Results layout:"
 log "  $OUTPUT_DIR/kernels/         — per-kernel CSVs + quick latency/speedup PNGs"
 log "  $OUTPUT_DIR/reports/         — 4-panel report PNGs (latency/speedup/tflops/roofline)"

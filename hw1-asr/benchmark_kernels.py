@@ -2514,6 +2514,17 @@ def benchmark_model_sweep(
     def _val(v, fmt=".1f"): return f"{v:{col_w}{fmt}}" if not math.isnan(v) else f"{'N/A':>{col_w}s}"
 
     has_both = len(labels_present) == 2
+    latency_speedup_by_gl: Dict[int, float] = {}
+    if has_both:
+        template_by_gl = {e["gen_len"]: e for e in all_results["template"]}
+        example_by_gl = {e["gen_len"]: e for e in all_results["example"]}
+        for gl in sorted(set(template_by_gl) & set(example_by_gl)):
+            template_mean = template_by_gl[gl].get("mean", float("nan"))
+            example_mean = example_by_gl[gl].get("mean", float("nan"))
+            if not math.isnan(template_mean) and not math.isnan(example_mean) and template_mean > 0:
+                latency_speedup_by_gl[gl] = example_mean / template_mean
+            else:
+                latency_speedup_by_gl[gl] = float("nan")
 
     print("\n" + "=" * 72)
     print("SWEEP SUMMARY  (template vs example)")
@@ -2580,13 +2591,20 @@ def benchmark_model_sweep(
         path = os.path.join(save_dir, "sweep_results.csv")
         fields = ["label", "gen_len", "mean", "std", "min", "max",
                   "tok_per_sec", "ms_per_tok", "peak_mem_mb", "n_generated",
-                  "wer", "cer", "hypothesis", "reference"]
+                  "wer", "cer", "latency_speedup_template_vs_example",
+                  "hypothesis", "reference"]
         with open(path, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
             w.writeheader()
             for lbl in labels_present:
                 for entry in all_results[lbl]:
-                    w.writerow({"label": lbl, **entry})
+                    w.writerow({
+                        "label": lbl,
+                        **entry,
+                        "latency_speedup_template_vs_example": latency_speedup_by_gl.get(
+                            entry["gen_len"], float("nan")
+                        ),
+                    })
         print(f"\n  Saved: {path}")
 
     # ------------------------------------------------------------------ #
@@ -2620,6 +2638,22 @@ def benchmark_model_sweep(
                 path = os.path.join(out_dir, f"sweep_{fname}.png")
                 fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
                 print(f"  Plot saved: {path}")
+
+            if has_both:
+                valid = [(gl, spd) for gl, spd in sorted(latency_speedup_by_gl.items())
+                         if not math.isnan(spd)]
+                if valid:
+                    xs, ys = zip(*valid)
+                    fig, ax = plt.subplots(figsize=(7, 4))
+                    ax.plot(xs, ys, marker="o", color="darkgreen", label="template vs example")
+                    ax.axhline(y=1.0, color="gray", linestyle="--", label="parity")
+                    ax.set_xlabel("max_new_tokens (decoder context)")
+                    ax.set_ylabel("Speedup vs example")
+                    ax.set_title("Performance Sweep - Speedup vs Example")
+                    ax.legend(); ax.grid(True)
+                    path = os.path.join(out_dir, "sweep_speedup.png")
+                    fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
+                    print(f"  Plot saved: {path}")
 
 
 # ---------------------------------------------------------------------------
