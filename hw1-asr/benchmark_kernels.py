@@ -26,7 +26,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -104,6 +104,22 @@ def timed_run(fn, warmup: int = 5, runs: int = 20) -> List[float]:
     return times
 
 
+def timed_run_collect_outputs(fn, warmup: int = 5, runs: int = 20) -> Tuple[List[float], List[Any]]:
+    """Run *fn* and return timed latencies plus each timed output."""
+    for _ in range(warmup):
+        fn()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    timer = TorchTimer()
+    times: List[float] = []
+    outputs: List[Any] = []
+    for _ in range(runs):
+        timer.start()
+        outputs.append(fn())
+        times.append(timer.stop())
+    return times, outputs
+
+
 def check_output(name: str, out: torch.Tensor, ref: torch.Tensor,
                  atol: float = 1e-2, rtol: float = 1e-2) -> bool:
     """Compare two tensors and print a PASS/FAIL correctness report."""
@@ -150,6 +166,12 @@ def _decode_output(output_ids, input_ids_len: int, processor) -> str:
             return str(gen)
 
 
+def _generated_token_count(output, input_ids_len: int, default: int) -> int:
+    if hasattr(output, "shape"):
+        return int(output.shape[-1] - input_ids_len)
+    return int(default)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -174,9 +196,51 @@ class BenchResult:
     max_ms:      float
     bw_gb:       float = 0.0
     tflops:      float = 0.0
+    median_ms:   float = float("nan")
+
+    def __post_init__(self):
+        if math.isnan(self.median_ms):
+            self.median_ms = self.mean_ms
 
 
 NA = float("nan")
+
+
+def _summarize_times(times: List[float]) -> Dict[str, float]:
+    arr = np.asarray(times, dtype=float)
+    return {
+        "mean": float(np.mean(arr)),
+        "std": float(np.std(arr)),
+        "min": float(np.min(arr)),
+        "max": float(np.max(arr)),
+        "median": float(np.median(arr)),
+    }
+
+
+def _latency_for_speedup(result: Optional[BenchResult]) -> float:
+    if result is None:
+        return NA
+    if not math.isnan(result.median_ms):
+        return result.median_ms
+    return result.mean_ms
+
+
+def _make_bench_result(kernel: str, variant: str, seq_len: int, block_label: str,
+                       times: List[float], bw_gb: float = NA, tflops: float = NA) -> BenchResult:
+    stats = _summarize_times(times)
+    return BenchResult(
+        kernel=kernel,
+        variant=variant,
+        seq_len=seq_len,
+        block_label=block_label,
+        mean_ms=stats["mean"],
+        std_ms=stats["std"],
+        min_ms=stats["min"],
+        max_ms=stats["max"],
+        bw_gb=bw_gb,
+        tflops=tflops,
+        median_ms=stats["median"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -249,24 +313,24 @@ def print_results(title: str,
         mm_rows.append(row)
     display_table("Latency min–max (ms)", header, mm_rows)
 
-    # --- Speedup vs PyTorch ---
+    # --- Speedup vs baseline (median latency) ---
     spd_rows = []
     for sl in seq_lens:
         pt = results[sl].get(pytorch_key)
-        pt_ms = pt.mean_ms if pt else NA
+        pt_ms = _latency_for_speedup(pt)
         row = [str(sl)]
         for v in variants:
             if v == pytorch_key:
                 row.append("  1.00x")
                 continue
             r = results[sl].get(v)
-            ms = r.mean_ms if r else NA
+            ms = _latency_for_speedup(r)
             if math.isnan(ms) or math.isnan(pt_ms) or ms == 0:
                 row.append("  N/A ")
             else:
                 row.append(f"{pt_ms / ms:6.2f}x")
         spd_rows.append(row)
-    display_table("Speedup vs PyTorch  (>1.0 = faster than PyTorch)", header, spd_rows)
+    display_table("Median speedup vs baseline  (>1.0 = faster than baseline)", header, spd_rows)
 
     # --- Bandwidth ---
     bw_rows = []
@@ -327,12 +391,13 @@ def save_csv(results: Dict[int, Dict[str, BenchResult]], kernel_name: str, out_d
     import csv
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["seq_len", "variant", "block_label", "mean_ms", "std_ms",
+        w.writerow(["seq_len", "variant", "block_label", "mean_ms", "median_ms", "std_ms",
                     "min_ms", "max_ms", "bw_gb", "tflops"])
         for sl, var_dict in sorted(results.items()):
             for var, r in var_dict.items():
                 w.writerow([r.seq_len, r.variant, r.block_label,
-                             _fmt(r.mean_ms), _fmt(r.std_ms), _fmt(r.min_ms), _fmt(r.max_ms),
+                             _fmt(r.mean_ms), _fmt(r.median_ms), _fmt(r.std_ms),
+                             _fmt(r.min_ms), _fmt(r.max_ms),
                              _fmt(r.bw_gb, 2), _fmt(r.tflops, 2)])
     print(f"  Saved: {path}")
 
@@ -371,10 +436,8 @@ def plot_results(results: Dict[int, Dict[str, BenchResult]],
     for v in all_variants:
         if v == pytorch_key:
             continue
-        pt_ms = [results[sl].get(pytorch_key, BenchResult("", "", sl, "", NA, NA, NA, NA)).mean_ms
-                 for sl in seq_lens]
-        ms_vals = [results[sl].get(v, BenchResult("", v, sl, "", NA, NA, NA, NA)).mean_ms
-                   for sl in seq_lens]
+        pt_ms = [_latency_for_speedup(results[sl].get(pytorch_key)) for sl in seq_lens]
+        ms_vals = [_latency_for_speedup(results[sl].get(v)) for sl in seq_lens]
         speedups = [(s, p / m) for s, p, m in zip(seq_lens, pt_ms, ms_vals)
                     if not math.isnan(p) and not math.isnan(m) and m > 0]
         if not speedups:
@@ -386,6 +449,63 @@ def plot_results(results: Dict[int, Dict[str, BenchResult]],
     ax2.set_xlabel("Sequence length")
     ax2.set_ylabel("Speedup vs PyTorch")
     ax2.set_title(f"{kernel_name} — Speedup vs PyTorch")
+    ax2.legend(fontsize=7)
+    ax2.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    out_path = os.path.join(out_dir, f"{kernel_name}.png")
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+    print(f"  Plot saved: {out_path}")
+
+
+def plot_results(results: Dict[int, Dict[str, BenchResult]],
+                 kernel_name: str, out_dir: str, pytorch_key: str = "pytorch"):
+    """Plot latency and median-based speedup curves for benchmark results."""
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("  matplotlib not available; skipping plot")
+        return
+
+    os.makedirs(out_dir, exist_ok=True)
+    seq_lens = sorted(results.keys())
+    all_variants = sorted({v for sl in seq_lens for v in results[sl]})
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    for v in all_variants:
+        ms_vals = [results[sl].get(v, BenchResult("", v, sl, "", NA, NA, NA, NA)).mean_ms
+                   for sl in seq_lens]
+        valid = [(s, m) for s, m in zip(seq_lens, ms_vals) if not math.isnan(m)]
+        if not valid:
+            continue
+        xs, ys = zip(*valid)
+        ls = "--" if v == pytorch_key else "-"
+        ax1.plot(xs, ys, linestyle=ls, marker="o", label=v)
+
+    ax1.set_xlabel("Sequence length")
+    ax1.set_ylabel("Latency (ms)")
+    ax1.set_title(f"{kernel_name} - Latency")
+    ax1.legend(fontsize=7)
+    ax1.grid(True, alpha=0.3)
+
+    for v in all_variants:
+        if v == pytorch_key:
+            continue
+        pt_ms = [_latency_for_speedup(results[sl].get(pytorch_key)) for sl in seq_lens]
+        ms_vals = [_latency_for_speedup(results[sl].get(v)) for sl in seq_lens]
+        speedups = [(s, p / m) for s, p, m in zip(seq_lens, pt_ms, ms_vals)
+                    if not math.isnan(p) and not math.isnan(m) and m > 0]
+        if not speedups:
+            continue
+        xs, ys = zip(*speedups)
+        ax2.plot(xs, ys, marker="o", label=v)
+
+    ax2.axhline(y=1.0, color="gray", linestyle="--", label=f"baseline ({pytorch_key})")
+    ax2.set_xlabel("Sequence length")
+    ax2.set_ylabel("Median speedup vs baseline")
+    ax2.set_title(f"{kernel_name} - Median speedup vs baseline")
     ax2.legend(fontsize=7)
     ax2.grid(True, alpha=0.3)
 
@@ -426,9 +546,6 @@ class AttentionBench:
             BH = B * H
             BD = next_power_of_two(D)
             scale = 1.0 / math.sqrt(D)
-            q_flat = q.reshape(BH, sl, D).contiguous()
-            k_flat = k.reshape(BH, sl, D).contiguous()
-            v_flat = v.reshape(BH, sl, D).contiguous()
 
             # -- Autotuned flash attention (template) --
             if tmpl_flash is not None:
@@ -436,7 +553,10 @@ class AttentionBench:
                 label = "flash_autotuned"
                 out = torch.empty((BH, sl, D), device=device, dtype=torch.float32)
                 try:
-                    def _run_flash_auto(BD=BD, out=out, sl=sl, BH=BH):
+                    def _run_flash_auto(BD=BD, out=out, sl=sl, BH=BH, q=q, k=k, v=v):
+                        q_flat = q.reshape(BH, sl, D).contiguous()
+                        k_flat = k.reshape(BH, sl, D).contiguous()
+                        v_flat = v.reshape(BH, sl, D).contiguous()
                         kernel[lambda meta: (triton.cdiv(sl, meta['BLOCK_M']), BH)](
                             q_flat, k_flat, v_flat, out,
                             float(scale), sl, sl, D,
@@ -464,12 +584,12 @@ class AttentionBench:
                     times = timed_run(_run_flash_auto, warmup=warmup, runs=runs)
                     flops = 4 * B * H * sl * sl * D
                     bw    = B * H * D * (3 * sl + sl) * 4  # no attn matrix in HBM
-                    mean  = np.mean(times)
-                    results[sl][label] = BenchResult(
+                    stats = _summarize_times(times)
+                    results[sl][label] = _make_bench_result(
                         kernel=self.NAME, variant=label, seq_len=sl, block_label=block_label,
-                        mean_ms=mean, std_ms=np.std(times), min_ms=np.min(times), max_ms=np.max(times),
-                        bw_gb=bw / (mean / 1000) / 1e9,
-                        tflops=flops / (mean / 1000) / 1e12,
+                        times=times,
+                        bw_gb=bw / (stats["mean"] / 1000) / 1e9,
+                        tflops=flops / (stats["mean"] / 1000) / 1e12,
                     )
                 except Exception as e:
                     print(f"    [flash_autotuned, seq={sl}] skipped: {type(e).__name__}: {e}")
@@ -477,25 +597,26 @@ class AttentionBench:
             # -- Example: 3-kernel basic attention --
             if exmp_attn is not None:
                 label = "example_basic"
-                try:
-                    def _run_example():
-                        exmp_attn.scaled_dot_product_attention(q, k, v, is_causal=False)
-                    times = timed_run(_run_example, warmup=warmup, runs=runs)
-                    flops = 4 * B * H * sl * sl * D
-                    # materialises full (BH, Q, K) attention matrix
-                    bw = B * H * (sl * D + 2 * sl * D + sl * sl + sl * D) * 4
-                    mean = np.mean(times)
-                    results[sl][label] = BenchResult(
-                        kernel=self.NAME, variant=label, seq_len=sl, block_label="n/a",
-                        mean_ms=mean, std_ms=np.std(times), min_ms=np.min(times), max_ms=np.max(times),
-                        bw_gb=bw / (mean / 1000) / 1e9,
-                        tflops=flops / (mean / 1000) / 1e12,
-                    )
-                    # Annotate if it actually fell back to PyTorch (MAX_ATTENTION_DIM limit)
-                    if sl > 256:
-                        results[sl][label].block_label = "n/a (PyTorch fallback >256)"
-                except Exception as e:
-                    print(f"    [example_basic, seq={sl}] skipped: {e}")
+                max_attention_dim = getattr(exmp_attn, "MAX_ATTENTION_DIM", 256)
+                if sl > max_attention_dim:
+                    print(f"    [example_basic, seq={sl}] skipped: seq_len exceeds example Triton limit ({max_attention_dim})")
+                else:
+                    try:
+                        def _run_example():
+                            exmp_attn.scaled_dot_product_attention(q, k, v, is_causal=False)
+                        times = timed_run(_run_example, warmup=warmup, runs=runs)
+                        flops = 4 * B * H * sl * sl * D
+                        # materialises full (BH, Q, K) attention matrix
+                        bw = B * H * (sl * D + 2 * sl * D + sl * sl + sl * D) * 4
+                        stats = _summarize_times(times)
+                        results[sl][label] = _make_bench_result(
+                            kernel=self.NAME, variant=label, seq_len=sl, block_label="n/a",
+                            times=times,
+                            bw_gb=bw / (stats["mean"] / 1000) / 1e9,
+                            tflops=flops / (stats["mean"] / 1000) / 1e12,
+                        )
+                    except Exception as e:
+                        print(f"    [example_basic, seq={sl}] skipped: {e}")
 
             # -- PyTorch SDPA baseline --
             label = "pytorch"
@@ -504,11 +625,12 @@ class AttentionBench:
                     torch.nn.functional.scaled_dot_product_attention(q, k, v)
                 times = timed_run(_run_pytorch, warmup=warmup, runs=runs)
                 flops = 4 * B * H * sl * sl * D
-                mean  = np.mean(times)
-                results[sl][label] = BenchResult(
+                stats = _summarize_times(times)
+                results[sl][label] = _make_bench_result(
                     kernel=self.NAME, variant=label, seq_len=sl, block_label="n/a",
-                    mean_ms=mean, std_ms=np.std(times), min_ms=np.min(times), max_ms=np.max(times),
-                    bw_gb=NA, tflops=flops / (mean / 1000) / 1e12,
+                    times=times,
+                    bw_gb=NA,
+                    tflops=flops / (stats["mean"] / 1000) / 1e12,
                 )
             except Exception as e:
                 print(f"    [pytorch, seq={sl}] skipped: {e}")
@@ -773,11 +895,11 @@ class LinearBench:
                     times = timed_run(_run_tmpl, warmup=warmup, runs=runs)
                     flops = 2 * M * K * N
                     bw    = (M * K + K * N + M * N) * 4
-                    mean  = np.mean(times)
-                    results[sl][label] = BenchResult(
-                        self.NAME, label, sl, "autotuned",
-                        mean, np.std(times), np.min(times), np.max(times),
-                        bw / (mean / 1000) / 1e9, flops / (mean / 1000) / 1e12,
+                    stats = _summarize_times(times)
+                    results[sl][label] = _make_bench_result(
+                        self.NAME, label, sl, "autotuned", times,
+                        bw / (stats["mean"] / 1000) / 1e9,
+                        flops / (stats["mean"] / 1000) / 1e12,
                     )
                 except Exception as e:
                     print(f"    [template linear autotuned, seq={sl}] skipped: {type(e).__name__}: {e}")
@@ -826,32 +948,30 @@ class LinearBench:
                                      atol=0.1, rtol=0.01)
                     times = timed_run(_run_int8, warmup=warmup, runs=runs)
                     flops = 2 * M * K * N
-                    mean  = np.mean(times)
-                    results[sl][label] = BenchResult(
-                        self.NAME, label, sl, "int8_autotuned",
-                        mean, np.std(times), np.min(times), np.max(times),
-                        (M * K + K * N + M * N) * 4 / (mean / 1000) / 1e9,
-                        flops / (mean / 1000) / 1e12,
+                    bytes_moved = M * K * 4 + K * N + M * N * 4
+                    stats = _summarize_times(times)
+                    results[sl][label] = _make_bench_result(
+                        self.NAME, label, sl, "int8_autotuned", times,
+                        bytes_moved / (stats["mean"] / 1000) / 1e9,
+                        flops / (stats["mean"] / 1000) / 1e12,
                     )
                 except Exception as e:
                     print(f"    [template linear int8, seq={sl}] skipped: {type(e).__name__}: {e}")
 
             # Example — uses BACKEND="cublas" (torch matmul) by default
             if exmp_layers is not None:
-                label = "example_cublas"
-                # Directly use torch matmul since example Linear uses it
-                w_orig = wt.t().contiguous()  # (N, K)
+                label = "cublas_baseline"
+                # Directly use torch matmul since the example Linear path delegates to cuBLAS.
                 try:
                     def _run_exmp():
                         torch.mm(x, wt)
                     times = timed_run(_run_exmp, warmup=warmup, runs=runs)
                     flops = 2 * M * K * N
-                    mean  = np.mean(times)
-                    results[sl][label] = BenchResult(
-                        self.NAME, label, sl, "cublas",
-                        mean, np.std(times), np.min(times), np.max(times),
-                        (M * K + K * N + M * N) * 4 / (mean / 1000) / 1e9,
-                        flops / (mean / 1000) / 1e12,
+                    stats = _summarize_times(times)
+                    results[sl][label] = _make_bench_result(
+                        self.NAME, label, sl, "cublas", times,
+                        (M * K + K * N + M * N) * 4 / (stats["mean"] / 1000) / 1e9,
+                        flops / (stats["mean"] / 1000) / 1e12,
                     )
                 except Exception as e:
                     print(f"    [example linear, seq={sl}] skipped: {e}")
@@ -863,17 +983,16 @@ class LinearBench:
                     torch.nn.functional.linear(x, wt.t())
                 times = timed_run(_run_pt, warmup=warmup, runs=runs)
                 flops = 2 * M * K * N
-                mean  = np.mean(times)
-                results[sl][label] = BenchResult(
-                    self.NAME, label, sl, "n/a",
-                    mean, np.std(times), np.min(times), np.max(times),
-                    (M * K + K * N + M * N) * 4 / (mean / 1000) / 1e9,
-                    flops / (mean / 1000) / 1e12,
+                stats = _summarize_times(times)
+                results[sl][label] = _make_bench_result(
+                    self.NAME, label, sl, "n/a", times,
+                    (M * K + K * N + M * N) * 4 / (stats["mean"] / 1000) / 1e9,
+                    flops / (stats["mean"] / 1000) / 1e12,
                 )
             except Exception as e:
                 print(f"    [pytorch linear, seq={sl}] skipped: {e}")
 
-        variants = ["template_autotuned", "template_int8", "example_cublas", "pytorch"]
+        variants = ["template_autotuned", "template_int8", "cublas_baseline", "pytorch"]
         variants = [v for v in variants if any(v in results[sl] for sl in seq_lens)]
         print_results(
             f"Linear GEMM Benchmark  (M=seq_len, K={hidden_size}, N={out_size}, {device})",
@@ -1151,42 +1270,46 @@ class Conv1dBench:
                                          out_p[0, :out_ch, :out_len], pt_ref[0],
                                          atol=0.05, rtol=0.01)
                         times = timed_run(_run, warmup=warmup, runs=runs)
-                        mean  = np.mean(times)
                         flops = 2 * out_ch * col_size * out_len
-                        results[sl][label] = BenchResult(
-                            self.NAME, label, sl, f"oc={out_ch}",
-                            mean, np.std(times), np.min(times), np.max(times),
-                            NA, flops / (mean / 1000) / 1e12,
+                        stats = _summarize_times(times)
+                        results[sl][label] = _make_bench_result(
+                            self.NAME, label, sl, f"oc={out_ch}", times,
+                            NA, flops / (stats["mean"] / 1000) / 1e12,
                         )
                     except Exception as e:
                         print(f"    [{label}, seq={sl}] skipped: {type(e).__name__}: {e}")
 
-            # PyTorch F.conv1d
-            label = "pytorch"
-            try:
-                xpt = torch.randn(1, in_channels, sl, device=device, dtype=torch.float32)
-                w0  = torch.randn(out_channels_list[0], in_channels, kernel_size, device=device, dtype=torch.float32)
-                def _run_pt():
-                    torch.nn.functional.conv1d(xpt, w0, stride=1)
-                times = timed_run(_run_pt, warmup=warmup, runs=runs)
-                mean  = np.mean(times)
-                results[sl][label] = BenchResult(
-                    self.NAME, label, sl, "n/a",
-                    mean, np.std(times), np.min(times), np.max(times),
-                    NA, NA,
-                )
-            except Exception as e:
-                print(f"    [pytorch conv1d, seq={sl}] skipped: {e}")
+                pt_label = f"pytorch_oc{out_ch}"
+                try:
+                    def _run_pt(x=x, w=w):
+                        torch.nn.functional.conv1d(x, w, stride=1)
+                    times = timed_run(_run_pt, warmup=warmup, runs=runs)
+                    results[sl][pt_label] = _make_bench_result(
+                        self.NAME, pt_label, sl, f"oc={out_ch}", times, NA, NA,
+                    )
+                except Exception as e:
+                    print(f"    [{pt_label}, seq={sl}] skipped: {e}")
 
-        variants = sorted({v for sl in seq_lens if sl in results for v in results[sl]})
-        print_results(
-            f"Conv1d Benchmark  (in_channels={in_channels}, kernel_size={kernel_size}, {device})",
-            results, variants,
-        )
+        for out_ch in out_channels_list:
+            group_variants = [f"template_oc{out_ch}", f"example_oc{out_ch}", f"pytorch_oc{out_ch}"]
+            group_variants = [v for v in group_variants if any(v in results[sl] for sl in results)]
+            if not group_variants:
+                continue
+            filtered_results = {
+                sl: {v: results[sl][v] for v in group_variants if v in results[sl]}
+                for sl in results
+                if any(v in results[sl] for v in group_variants)
+            }
+            pt_label = f"pytorch_oc{out_ch}"
+            print_results(
+                f"Conv1d Benchmark  (in_channels={in_channels}, kernel_size={kernel_size}, out_channels={out_ch}, {device})",
+                filtered_results, group_variants, pytorch_key=pt_label,
+            )
+            if do_plot:
+                plot_results(filtered_results, f"{self.NAME}_oc{out_ch}", save_dir or "results",
+                             pytorch_key=pt_label)
         if save_dir:
             save_csv(results, self.NAME, save_dir)
-        if do_plot:
-            plot_results(results, self.NAME, save_dir or "results")
         return results
 
 
@@ -1244,11 +1367,8 @@ class RoPEBench:
                             check_output(f"rope_cos hd={half_dim} seq={sl}", cos_out, cos_ref)
                             check_output(f"rope_sin hd={half_dim} seq={sl}", sin_out, sin_ref)
                         times = timed_run(_run, warmup=warmup, runs=runs)
-                        mean  = np.mean(times)
-                        results[sl][label] = BenchResult(
-                            self.NAME, label, sl, f"hd={half_dim}",
-                            mean, np.std(times), np.min(times), np.max(times),
-                            NA, NA,
+                        results[sl][label] = _make_bench_result(
+                            self.NAME, label, sl, f"hd={half_dim}", times, NA, NA,
                         )
                     except Exception as e:
                         print(f"    [{label}, seq={sl}] skipped: {e}")
@@ -1258,13 +1378,14 @@ class RoPEBench:
                 try:
                     def _run_pt(positions=positions, inv_freq=inv_freq):
                         freqs = positions[:, None] * inv_freq[None, :]
-                        cos_vals = torch.cos(freqs); sin_vals = torch.sin(freqs)  # noqa: F841
+                        cos_half = torch.cos(freqs)
+                        sin_half = torch.sin(freqs)
+                        cos_vals = torch.cat([cos_half, cos_half], dim=-1)
+                        sin_vals = torch.cat([sin_half, sin_half], dim=-1)
+                        return cos_vals, sin_vals
                     times = timed_run(_run_pt, warmup=warmup, runs=runs)
-                    mean  = np.mean(times)
-                    results[sl][pt_label] = BenchResult(
-                        self.NAME, pt_label, sl, "n/a",
-                        mean, np.std(times), np.min(times), np.max(times),
-                        NA, NA,
+                    results[sl][pt_label] = _make_bench_result(
+                        self.NAME, pt_label, sl, "n/a", times, NA, NA,
                     )
                 except Exception as e:
                     print(f"    [pytorch rope hd={half_dim}, seq={sl}] skipped: {e}")
@@ -1932,17 +2053,24 @@ def benchmark_model(audio_path: str, warmup: int = 2, runs: int = 5,
                 torch.cuda.reset_peak_memory_stats()
 
             print(f"  Timing ({runs} runs)...")
-            times = timed_run(_call, warmup=0, runs=runs)
+            times, outputs = timed_run_collect_outputs(_call, warmup=0, runs=runs)
 
             peak_mem_mb = (torch.cuda.max_memory_allocated() / 1024**2
                            if torch.cuda.is_available() else float("nan"))
 
+            output = outputs[-1] if outputs else output
             transcription = _decode_transcription(processor, output)
 
-            # Count generated tokens
-            n_generated = output.shape[-1] - input_ids.shape[-1] if hasattr(output, "shape") else max_new_tokens
-            mean_ms = np.mean(times)
-            tok_per_sec = n_generated / (mean_ms / 1000.0) if mean_ms > 0 else float("nan")
+            stats = _summarize_times(times)
+            generated_counts = [
+                _generated_token_count(out, input_ids.shape[-1], max_new_tokens)
+                for out in outputs
+            ]
+            total_generated = float(np.sum(generated_counts))
+            total_time_s = float(np.sum(times)) / 1000.0
+            avg_generated = float(np.mean(generated_counts)) if generated_counts else float(max_new_tokens)
+            mean_ms = stats["mean"]
+            tok_per_sec = total_generated / total_time_s if total_time_s > 0 else float("nan")
 
             # Per-component profiler pass (one call, not in timing loop)
             print(f"  Profiling components...")
@@ -1950,11 +2078,14 @@ def benchmark_model(audio_path: str, warmup: int = 2, runs: int = 5,
             component_groups  = _aggregate_component_timings(component_timings)
 
             results[label] = {
-                "mean": mean_ms,       "std": np.std(times),
-                "min":  np.min(times), "max": np.max(times),
+                "mean": mean_ms,
+                "median": stats["median"],
+                "std": stats["std"],
+                "min": stats["min"],
+                "max": stats["max"],
                 "tok_per_sec": tok_per_sec,
                 "peak_mem_mb": peak_mem_mb,
-                "n_generated": n_generated,
+                "n_generated": avg_generated,
                 "transcription": transcription,
                 "components": component_groups,
             }
@@ -1998,21 +2129,34 @@ def benchmark_model(audio_path: str, warmup: int = 2, runs: int = 5,
         print(f"{'':28s}{'speedup':>{col_w}s}")
     print("-" * (28 + col_w * (len(labels_present) + (1 if len(labels_present) == 2 else 0))))
 
-    def _row(name, key, fmt=".1f", suffix=""):
+    def _row(name, key, fmt=".1f", suffix="", speedup_mode: Optional[str] = None,
+             speedup_key: Optional[str] = None):
         vals = [results[l].get(key, float("nan")) for l in labels_present]
         row = f"{name:<28s}" + "".join(f"{v:{col_w}{fmt}}{suffix}" if not math.isnan(v) else f"{'N/A':>{col_w}s}" for v in vals)
-        if len(labels_present) == 2 and not any(math.isnan(v) for v in vals) and vals[0] > 0:
-            spd = vals[1] / vals[0]  # example / template (>1 means template faster)
-            row += f"{spd:{col_w}.2f}x"
+        if len(labels_present) == 2 and speedup_mode is not None:
+            if speedup_key is None:
+                speedup_vals = vals
+            else:
+                speedup_vals = [results[l].get(speedup_key, float("nan")) for l in labels_present]
+            if not any(math.isnan(v) for v in speedup_vals):
+                if speedup_mode == "latency" and speedup_vals[0] > 0:
+                    spd = speedup_vals[1] / speedup_vals[0]
+                    row += f"{spd:{col_w}.2f}x"
+                elif speedup_mode == "throughput" and speedup_vals[1] > 0:
+                    spd = speedup_vals[0] / speedup_vals[1]
+                    row += f"{spd:{col_w}.2f}x"
         print(row)
 
-    _row("Mean latency (ms)",   "mean",        ".1f")
+    _row("Mean latency (ms)",   "mean",        ".1f", speedup_mode="latency", speedup_key="median")
+    _row("Median latency (ms)", "median",      ".1f", speedup_mode="latency", speedup_key="median")
     _row("Std (ms)",            "std",         ".1f")
     _row("Min (ms)",            "min",         ".1f")
     _row("Max (ms)",            "max",         ".1f")
-    _row("Throughput (tok/s)",  "tok_per_sec", ".1f")
+    _row("Throughput (tok/s)",  "tok_per_sec", ".1f", speedup_mode="throughput")
     _row("Peak GPU mem (MB)",   "peak_mem_mb", ".0f")
     _row("Tokens generated",    "n_generated", ".0f")
+    if len(labels_present) == 2:
+        print("Note: latency speedup uses median latency; throughput speedup uses tok/s.")
 
     # Per-component breakdown
     all_components = sorted({c for l in labels_present for c in results[l].get("components", {})})
@@ -2453,19 +2597,28 @@ def benchmark_model_sweep(
                 for _ in range(warmup):
                     output = _call()
 
+                if torch.cuda.is_available():
+                    torch.cuda.reset_peak_memory_stats()
+                times, outputs = timed_run_collect_outputs(_call, warmup=0, runs=runs)
+                peak_mem = (torch.cuda.max_memory_allocated() / 1024**2
+                            if torch.cuda.is_available() else float("nan"))
+
+                output = outputs[-1] if outputs else output
                 hypothesis_text = _decode_output(output, input_ids.shape[-1], processor) \
                     if hasattr(output, "shape") else ""
                 wer, cer = _wer_cer(hypothesis_text, reference_text)
 
-                if torch.cuda.is_available():
-                    torch.cuda.reset_peak_memory_stats()
-                times = timed_run(_call, warmup=0, runs=runs)
-                peak_mem = (torch.cuda.max_memory_allocated() / 1024**2
-                            if torch.cuda.is_available() else float("nan"))
-
-                mean_ms    = float(np.mean(times))
-                tok_per_sec = gen_len / (mean_ms / 1000.0) if mean_ms > 0 else float("nan")
-                ms_per_tok  = mean_ms / gen_len if gen_len > 0 else float("nan")
+                stats = _summarize_times(times)
+                generated_counts = [
+                    _generated_token_count(out, input_ids.shape[-1], gen_len)
+                    for out in outputs
+                ]
+                total_generated = float(np.sum(generated_counts))
+                total_time_s = float(np.sum(times)) / 1000.0
+                avg_generated = float(np.mean(generated_counts)) if generated_counts else float(gen_len)
+                mean_ms = stats["mean"]
+                tok_per_sec = total_generated / total_time_s if total_time_s > 0 else float("nan")
+                ms_per_tok = mean_ms / avg_generated if avg_generated > 0 else float("nan")
 
                 print(f"  {mean_ms:.1f}ms  {tok_per_sec:.1f}tok/s  {ms_per_tok:.2f}ms/tok  {peak_mem:.0f}MB")
                 _show = lambda s, n=200: s[:n] + "..." if len(s) > n else s
@@ -2475,13 +2628,14 @@ def benchmark_model_sweep(
                 label_results.append({
                     "gen_len":     gen_len,
                     "mean":        mean_ms,
-                    "std":         float(np.std(times)),
-                    "min":         float(np.min(times)),
-                    "max":         float(np.max(times)),
+                    "median":      stats["median"],
+                    "std":         stats["std"],
+                    "min":         stats["min"],
+                    "max":         stats["max"],
                     "tok_per_sec": tok_per_sec,
                     "ms_per_tok":  ms_per_tok,
                     "peak_mem_mb": peak_mem,
-                    "n_generated": gen_len,
+                    "n_generated": avg_generated,
                     "wer":         wer,
                     "cer":         cer,
                     "hypothesis":  hypothesis_text,
@@ -2519,10 +2673,10 @@ def benchmark_model_sweep(
         template_by_gl = {e["gen_len"]: e for e in all_results["template"]}
         example_by_gl = {e["gen_len"]: e for e in all_results["example"]}
         for gl in sorted(set(template_by_gl) & set(example_by_gl)):
-            template_mean = template_by_gl[gl].get("mean", float("nan"))
-            example_mean = example_by_gl[gl].get("mean", float("nan"))
-            if not math.isnan(template_mean) and not math.isnan(example_mean) and template_mean > 0:
-                latency_speedup_by_gl[gl] = example_mean / template_mean
+            template_median = template_by_gl[gl].get("median", template_by_gl[gl].get("mean", float("nan")))
+            example_median = example_by_gl[gl].get("median", example_by_gl[gl].get("mean", float("nan")))
+            if not math.isnan(template_median) and not math.isnan(example_median) and template_median > 0:
+                latency_speedup_by_gl[gl] = example_median / template_median
             else:
                 latency_speedup_by_gl[gl] = float("nan")
 
@@ -2532,6 +2686,7 @@ def benchmark_model_sweep(
 
     for metric_key, metric_label, fmt in [
         ("mean",        "Mean latency (ms)",      ".1f"),
+        ("median",      "Median latency (ms)",    ".1f"),
         ("tok_per_sec", "Throughput (tok/s)",      ".1f"),
         ("ms_per_tok",  "Latency/token (ms/tok)", ".2f"),
         ("peak_mem_mb", "Peak GPU mem (MB)",       ".0f"),
@@ -2554,13 +2709,13 @@ def benchmark_model_sweep(
             row = f"{gl:>10d}"
             vals = [rows_by_gl[gl].get(l, float("nan")) for l in labels_present]
             row += "".join(_val(v, fmt) for v in vals)
-            if has_both and not any(math.isnan(v) for v in vals) and vals[0] > 0:
-                # For latency metrics: lower is better → speedup = example / template
-                # For throughput: higher is better → speedup = template / example
-                if metric_key in ("mean", "ms_per_tok"):
-                    spd = vals[1] / vals[0]
+            if has_both and not any(math.isnan(v) for v in vals):
+                if metric_key in ("mean", "median"):
+                    spd = latency_speedup_by_gl.get(gl, float("nan"))
+                elif metric_key in ("ms_per_tok",):
+                    spd = vals[1] / vals[0] if vals[0] > 0 else float("nan")
                 elif metric_key in ("tok_per_sec",):
-                    spd = vals[0] / vals[1]
+                    spd = vals[0] / vals[1] if vals[1] > 0 else float("nan")
                 else:
                     spd = float("nan")  # WER/CER: no meaningful speedup ratio
                 if not math.isnan(spd):
@@ -2568,7 +2723,7 @@ def benchmark_model_sweep(
             print(row)
 
     print(f"\n{'─'*72}")
-    print("Note: speedup > 1x means template is faster than example.")
+    print("Note: speedup > 1x means template is faster than example; latency speedup uses median latency.")
 
     # Output-match check
     if has_both:
@@ -2589,7 +2744,7 @@ def benchmark_model_sweep(
         import csv
         os.makedirs(save_dir, exist_ok=True)
         path = os.path.join(save_dir, "sweep_results.csv")
-        fields = ["label", "gen_len", "mean", "std", "min", "max",
+        fields = ["label", "gen_len", "mean", "median", "std", "min", "max",
                   "tok_per_sec", "ms_per_tok", "peak_mem_mb", "n_generated",
                   "wer", "cer", "latency_speedup_template_vs_example",
                   "hypothesis", "reference"]

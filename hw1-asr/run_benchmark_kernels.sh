@@ -112,6 +112,7 @@ log "===================================="
 log "HOST:                     $(hostname)"
 log "JOB:                      ${SLURM_JOB_ID:-local}"
 log "PROJECT_DIR:              $PROJECT_DIR"
+log "HW1_DIR:                  $HW1_DIR"
 log "OUTPUT_DIR:               $OUTPUT_DIR"
 log "LOG_FILE:                 $LOG_FILE"
 log "RUNS (kernel):            $RUNS"
@@ -129,10 +130,22 @@ log "AUDIO:                    $AUDIO"
 log "LIBRISPEECH_DATA_DIR:     $LIBRISPEECH_DATA_DIR"
 log "MODEL_SWEEP_SEQ_LENS:     $MODEL_SWEEP_SEQ_LENS"
 log "MODEL_CORRECTNESS_N:      $MODEL_CORRECTNESS_UTTERANCES"
+GIT_SHA=$(git -C "$PROJECT_DIR" rev-parse HEAD 2>/dev/null || echo "unknown")
+if [ -n "$(git -C "$PROJECT_DIR" status --porcelain 2>/dev/null)" ]; then
+  GIT_DIRTY="dirty"
+else
+  GIT_DIRTY="clean"
+fi
+log "GIT_SHA:                  $GIT_SHA"
+log "GIT_STATUS:               $GIT_DIRTY"
+log "GPU_REQUEST:              gpu:1g.18gb:1"
+log "NOTE:                     Throughput/roofline numbers are for the requested MIG slice, not a full GPU."
 log "===================================="
 
 log "Python: $(which python)"
 python -V
+log "GPU inventory (nvidia-smi -L):"
+nvidia-smi -L || true
 nvidia-smi || true
 
 # ---------------------------------------------------------------------------
