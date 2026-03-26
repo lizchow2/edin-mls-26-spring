@@ -59,7 +59,7 @@ def _make_linear_configs():
     # Empirically BLOCK_M >= 32 can also trigger this on fp32 matmul; restrict
     # to BLOCK_M=16 on sm_90+ to stay on HMMA/FFMA paths only.
     cc = torch.cuda.get_device_capability() if torch.cuda.is_available() else (8, 0)
-    max_block_m = 16 if cc[0] >= 9 else 128
+    max_block_m = 128 if cc[0] >= 9 else 128
     candidates = [
         # Decode-path (M=1–16): small M tiles, wider N
         triton.Config({'BLOCK_M': 16,  'BLOCK_N': 32,  'BLOCK_K': 32, 'GROUP_SIZE': 8}, num_warps=2),
@@ -77,7 +77,7 @@ _LINEAR_CONFIGS = _make_linear_configs()
 
 def _make_linear_int8_configs():
     cc = torch.cuda.get_device_capability() if torch.cuda.is_available() else (8, 0)
-    max_block_m = 16 if cc[0] >= 9 else 128
+    max_block_m = 128 if cc[0] >= 9 else 128
     candidates = [
         triton.Config({'BLOCK_M': 16,  'BLOCK_N': 32,  'BLOCK_K': 32}, num_warps=2),
         triton.Config({'BLOCK_M': 16,  'BLOCK_N': 64,  'BLOCK_K': 32}, num_warps=4),
