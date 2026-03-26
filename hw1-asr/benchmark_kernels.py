@@ -2666,6 +2666,9 @@ def main():
         help="Max new tokens for model benchmark")
     parser.add_argument("--save", type=str, default=None,
         help="Directory to save CSV results")
+    parser.add_argument("--data-dir", type=str, default=None,
+        help="Path to LibriSpeech data root (default: <script_dir>/data). "
+             "Pre-stage the dataset here on clusters without internet access.")
     parser.add_argument("--plot", action="store_true",
         help="Generate matplotlib PNG plots")
     parser.add_argument("--check", action="store_true",
@@ -2684,11 +2687,13 @@ def main():
     if torch.cuda.is_available():
         print(f"GPU:    {torch.cuda.get_device_name(0)}")
 
+    data_dir = args.data_dir if args.data_dir else os.path.join(_SCRIPT_DIR, "data")
+
     # -- Correctness E2E (WER/CER on real utterances) --
     if args.kernel.strip() == "model_correctness":
         n_utt = int(args.seq_lens) if args.seq_lens and args.seq_lens.isdigit() else 15
         benchmark_model_correctness(
-            data_dir=os.path.join(_SCRIPT_DIR, "data"),
+            data_dir=data_dir,
             n_utterances=n_utt,
             max_new_tokens=args.max_new_tokens,
             save_dir=args.save,
@@ -2702,7 +2707,7 @@ def main():
         gen_lens = ([int(x) for x in args.seq_lens.split(",")]
                     if args.seq_lens else None)
         benchmark_model_sweep(
-            data_dir=os.path.join(_SCRIPT_DIR, "data"),
+            data_dir=data_dir,
             target_gen_lens=gen_lens,
             warmup=args.warmup,
             runs=runs,

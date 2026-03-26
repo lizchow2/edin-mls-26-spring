@@ -35,7 +35,8 @@ BLOCK_SIZES_ROPE=${BLOCK_SIZES_ROPE:-16,32,64}
 MODEL_RUNS=${MODEL_RUNS:-20}
 MODEL_WARMUP=${MODEL_WARMUP:-5}
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-100}
-AUDIO=${AUDIO:-$PROJECT_DIR/test_audio.wav}
+AUDIO=${AUDIO:-$HW1_DIR/test_audio.wav}
+LIBRISPEECH_DATA_DIR=${LIBRISPEECH_DATA_DIR:-$HW1_DIR/data}
 
 # Model sweep settings
 MODEL_SWEEP_SEQ_LENS=${MODEL_SWEEP_SEQ_LENS:-10,25,50,75,100,150,200}
@@ -129,6 +130,7 @@ log "MODEL_RUNS:               $MODEL_RUNS"
 log "MODEL_WARMUP:             $MODEL_WARMUP"
 log "MAX_NEW_TOKENS:           $MAX_NEW_TOKENS"
 log "AUDIO:                    $AUDIO"
+log "LIBRISPEECH_DATA_DIR:     $LIBRISPEECH_DATA_DIR"
 log "MODEL_SWEEP_SEQ_LENS:     $MODEL_SWEEP_SEQ_LENS"
 log "MODEL_CORRECTNESS_N:      $MODEL_CORRECTNESS_UTTERANCES"
 log "===================================="
@@ -223,6 +225,7 @@ python "$HW1_DIR/benchmark_kernels.py" \
   --runs "$MODEL_RUNS" \
   --warmup "$MODEL_WARMUP" \
   --save "$OUTPUT_DIR/model_sweep" \
+  --data-dir "$LIBRISPEECH_DATA_DIR" \
   --plot
 
 log "==== PHASE 3 complete. Sweep CSV + PNGs in $OUTPUT_DIR/model_sweep ===="
@@ -238,6 +241,7 @@ python "$HW1_DIR/benchmark_kernels.py" \
   --seq-lens "$MODEL_CORRECTNESS_UTTERANCES" \
   --max-new-tokens 200 \
   --save "$OUTPUT_DIR/model_correctness" \
+  --data-dir "$LIBRISPEECH_DATA_DIR" \
   --plot
 
 log "==== PHASE 4 complete. Correctness CSV + PNGs in $OUTPUT_DIR/model_correctness ===="
