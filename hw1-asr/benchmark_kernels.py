@@ -2067,8 +2067,8 @@ def _load_librispeech_samples(data_dir: str, max_samples_needed: int):
     """
     try:
         import torchaudio  # type: ignore
-    except ImportError:
-        print("  [sweep] torchaudio not found – using synthetic silence.")
+    except Exception:
+        print("  [sweep] torchaudio unavailable – using synthetic silence.")
         return np.zeros(max_samples_needed, dtype=np.float32), []
 
     os.makedirs(data_dir, exist_ok=True)
@@ -2123,8 +2123,8 @@ def _load_librispeech_utterances(data_dir: str, n: int = 15):
     """Load up to n individual LibriSpeech test-clean utterances as (audio, transcript) pairs."""
     try:
         import torchaudio  # type: ignore
-    except ImportError:
-        print("  [correctness] torchaudio not found – returning empty utterance list.")
+    except Exception:
+        print("  [correctness] torchaudio unavailable – returning empty utterance list.")
         return []
     os.makedirs(data_dir, exist_ok=True)
     try:

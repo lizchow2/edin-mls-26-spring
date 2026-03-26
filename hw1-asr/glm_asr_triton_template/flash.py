@@ -22,13 +22,14 @@ def _flash_shm_budget() -> int:
 def _make_flash_configs(shm_budget: int, block_d: int = 128):
     """Generate valid flash attention autotune configs filtered by shared memory constraint."""
     candidates = [
-        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 16}, num_warps=2, num_stages=2),
-        triton.Config({'BLOCK_M': 16, 'BLOCK_N': 32}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 16}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_warps=8, num_stages=3),
+    triton.Config({'BLOCK_M': 16, 'BLOCK_N': 16}, num_warps=2, num_stages=2),
+    triton.Config({'BLOCK_M': 16, 'BLOCK_N': 32}, num_warps=4, num_stages=2),
+    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 16}, num_warps=4, num_stages=2),
+    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32}, num_warps=4, num_stages=2),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_warps=4, num_stages=2),
+    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64}, num_warps=4, num_stages=2),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_warps=8, num_stages=2),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_warps=8, num_stages=2),
     ]
     # Each SM needs q_tile (BLOCK_M, BLOCK_D) + acc (BLOCK_M, BLOCK_D) + k/v tile (BLOCK_N, BLOCK_D)
     return [
