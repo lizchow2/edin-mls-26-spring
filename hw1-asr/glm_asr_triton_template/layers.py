@@ -75,6 +75,10 @@ def _make_linear_configs():
 
 _LINEAR_CONFIGS = _make_linear_configs()
 
+_LINEAR_MAX_BLOCK_M = max(cfg.kwargs['BLOCK_M'] for cfg in _LINEAR_CONFIGS)
+_LINEAR_MAX_BLOCK_N = max(cfg.kwargs['BLOCK_N'] for cfg in _LINEAR_CONFIGS)
+_LINEAR_MAX_BLOCK_K = max(cfg.kwargs['BLOCK_K'] for cfg in _LINEAR_CONFIGS)
+
 def _make_linear_int8_configs():
     cc = torch.cuda.get_device_capability() if torch.cuda.is_available() else (8, 0)
     max_block_m = 128 if cc[0] >= 9 else 128
@@ -91,6 +95,10 @@ def _make_linear_int8_configs():
 
 # Configs for int8 kernel (2D grid, no GROUP_SIZE)
 _LINEAR_INT8_CONFIGS = _make_linear_int8_configs()
+
+_LINEAR_INT8_MAX_BLOCK_M = max(cfg.kwargs['BLOCK_M'] for cfg in _LINEAR_INT8_CONFIGS)
+_LINEAR_INT8_MAX_BLOCK_N = max(cfg.kwargs['BLOCK_N'] for cfg in _LINEAR_INT8_CONFIGS)
+_LINEAR_INT8_MAX_BLOCK_K = max(cfg.kwargs['BLOCK_K'] for cfg in _LINEAR_INT8_CONFIGS)
 
 # ============================================================================
 # Triton Kernels
@@ -1073,8 +1081,8 @@ class Linear:
         if self._weight_t_padded is None:
             K = self.in_features
             N = self.out_features
-            self._K_padded = pad_to_multiple(K, self.TILE_K)
-            self._N_padded = pad_to_multiple(N, self.TILE_N)
+            self._K_padded = pad_to_multiple(K, _LINEAR_MAX_BLOCK_K)
+            self._N_padded = pad_to_multiple(N, _LINEAR_MAX_BLOCK_N)
 
             weight_t = self.weight.t().contiguous().to(torch.float32)
             if self._K_padded > K or self._N_padded > N:
@@ -1092,8 +1100,8 @@ class Linear:
         if self._weight_int8 is None:
             K = self.in_features
             N = self.out_features
-            K_padded = pad_to_multiple(K, self.TILE_K)
-            N_padded = pad_to_multiple(N, self.TILE_N)
+            K_padded = pad_to_multiple(K, _LINEAR_INT8_MAX_BLOCK_K)
+            N_padded = pad_to_multiple(N, _LINEAR_INT8_MAX_BLOCK_N)
 
             w = self.weight.float()  # (N, K)
             scale = w.abs().max(dim=1, keepdim=True).values / 127.0  # (N, 1)
@@ -1161,7 +1169,7 @@ class Linear:
             self._weight_t_padded = None
         self._ensure_weight_prepared()
 
-        M_padded = pad_to_multiple(M, self.TILE_M)
+        M_padded = pad_to_multiple(M, _LINEAR_MAX_BLOCK_M)
 
         if M_padded > M or self._K_padded > K:
             x_padded = torch.zeros(
@@ -1226,9 +1234,9 @@ class Linear:
             self._weight_scale = self._weight_scale.to(x.device)
             self.weight = self.weight.to(x.device)
 
-        M_padded = pad_to_multiple(M, 128)  # 128 = max BLOCK_M across _LINEAR_INT8_CONFIGS
-        K_padded = pad_to_multiple(K, self.TILE_K)
-        N_padded = pad_to_multiple(N, self.TILE_N)
+        M_padded = pad_to_multiple(M, _LINEAR_INT8_MAX_BLOCK_M)
+        K_padded = pad_to_multiple(K, _LINEAR_INT8_MAX_BLOCK_K)
+        N_padded = pad_to_multiple(N, _LINEAR_INT8_MAX_BLOCK_N)
 
         if M_padded > M or K_padded > K:
             x_padded = torch.zeros((M_padded, K_padded), dtype=torch.float32, device=x.device)
@@ -1403,9 +1411,9 @@ class MLP:
         K = self.hidden_size
         N = self.intermediate_size
 
-        M_pad = pad_to_multiple(M, self.TILE_M)
-        K_pad = pad_to_multiple(K, self.TILE_K)
-        N_pad = pad_to_multiple(N, self.TILE_N)
+        M_pad = pad_to_multiple(M, _LINEAR_MAX_BLOCK_M)
+        K_pad = pad_to_multiple(K, _LINEAR_MAX_BLOCK_K)
+        N_pad = pad_to_multiple(N, _LINEAR_MAX_BLOCK_N)
 
         if M != M_pad or K != K_pad:
             x_padded = torch.zeros(
@@ -1511,9 +1519,9 @@ class EncoderMLP:
         K = self.hidden_size
         N = self.intermediate_size
 
-        M_pad = pad_to_multiple(M, self.TILE_M)
-        K_pad = pad_to_multiple(K, self.TILE_K)
-        N_pad = pad_to_multiple(N, self.TILE_N)
+        M_pad = pad_to_multiple(M, _LINEAR_MAX_BLOCK_M)
+        K_pad = pad_to_multiple(K, _LINEAR_MAX_BLOCK_K)
+        N_pad = pad_to_multiple(N, _LINEAR_MAX_BLOCK_N)
 
         if M != M_pad or K != K_pad:
             x_padded = torch.zeros(
