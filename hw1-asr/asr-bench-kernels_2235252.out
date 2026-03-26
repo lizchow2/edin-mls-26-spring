@@ -1,0 +1,11 @@
+[2026-03-26 15:05:40] WARNING: conda not found — trying eval shell hook fallback
+/var/spool/slurmd/job2235252/slurm_script: eval: line 112: syntax error near unexpected token `('
+/var/spool/slurmd/job2235252/slurm_script: eval: line 112: `[2026-03-26 15:05:40] ERROR: command failed (exit=1) at line 16'
+[2026-03-26 15:05:40] ERROR: command failed (exit=1) at line 16
+[2026-03-26 15:05:40] ERROR: last command: [[ -n $CRICHTON_DEBUG ]]
+[2026-03-26 15:05:40] ERROR: full log: /home/s2890639/projects/edin-mls-26-spring/results_kernels/run_2235252/logs/benchmark_run_2235252_20260326_150540.log
+[2026-03-26 15:05:40] ERROR: command failed (exit=1) at line 113
+[2026-03-26 15:05:40] ERROR: last command: conda activate mls
+[2026-03-26 15:05:40] ERROR: full log: /home/s2890639/projects/edin-mls-26-spring/results_kernels/run_2235252/logs/benchmark_run_2235252_20260326_150540.log
+[2026-03-26 15:05:40] Benchmark suite exited with status 1.
+[2026-03-26 15:05:40] Check log file: /home/s2890639/projects/edin-mls-26-spring/results_kernels/run_2235252/logs/benchmark_run_2235252_20260326_150540.log

@@ -1,0 +1,64 @@
+[2026-03-26 13:02:20] ====================================
+[2026-03-26 13:02:20] HOST:                     saxa.inf.ed.ac.uk
+[2026-03-26 13:02:20] JOB:                      2235090
+[2026-03-26 13:02:20] PROJECT_DIR:              /home/s2890639/projects/edin-mls-26-spring
+[2026-03-26 13:02:20] OUTPUT_DIR:               /home/s2890639/projects/edin-mls-26-spring/results_kernels/run_2235090
+[2026-03-26 13:02:20] LOG_FILE:                 /home/s2890639/projects/edin-mls-26-spring/results_kernels/run_2235090/logs/benchmark_run_2235090_20260326_130219.log
+[2026-03-26 13:02:20] RUNS (kernel):            100
+[2026-03-26 13:02:20] WARMUP (kernel):          10
+[2026-03-26 13:02:20] SEQ_LENS_KERNEL:          64,128,256,512,1024,2048
+[2026-03-26 13:02:20] BLOCK_SIZES_ATTN:         16,32,64
+[2026-03-26 13:02:20] BLOCK_SIZES_NORM:         256,512,1024,2048
+[2026-03-26 13:02:20] BLOCK_SIZES_LINEAR:       32,64,128
+[2026-03-26 13:02:20] BLOCK_SIZES_CONV:         32,64,128
+[2026-03-26 13:02:20] BLOCK_SIZES_ROPE:         16,32,64
+[2026-03-26 13:02:20] MODEL_RUNS:               20
+[2026-03-26 13:02:20] MODEL_WARMUP:             5
+[2026-03-26 13:02:20] MAX_NEW_TOKENS:           100
+[2026-03-26 13:02:20] AUDIO:                    /home/s2890639/projects/edin-mls-26-spring/hw1-asr/test_audio.wav
+[2026-03-26 13:02:20] LIBRISPEECH_DATA_DIR:     /home/s2890639/projects/edin-mls-26-spring/hw1-asr/data
+[2026-03-26 13:02:20] MODEL_SWEEP_SEQ_LENS:     10,25,50,75,100,150,200
+[2026-03-26 13:02:20] MODEL_CORRECTNESS_N:      20
+[2026-03-26 13:02:20] ====================================
+[2026-03-26 13:02:21] Python: /home/s2890639/.conda/envs/mls/bin/python
+Python 3.11.15
+Thu Mar 26 13:02:21 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.126.09             Driver Version: 580.126.09     CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA H200                    On  |   00000000:4C:00.0 Off |                   On |
+| N/A   30C    P0            129W /  700W |    3139MiB / 143771MiB |     N/A      Default |
+|                                         |                        |              Enabled |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| MIG devices:                                                                            |
++------------------+----------------------------------+-----------+-----------------------+
+| GPU  GI  CI  MIG |              Shared Memory-Usage |        Vol|        Shared         |
+|      ID  ID  Dev |                Shared BAR1-Usage | SM     Unc| CE ENC  DEC  OFA  JPG |
+|                  |                                  |        ECC|                       |
+|==================+==================================+===========+=======================|
+|  0    9   0   0  |              15MiB / 16384MiB    | 16      0 |  1   0    1    0    1 |
+|                  |               0MiB / 14809MiB    |           |                       |
++------------------+----------------------------------+-----------+-----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+[2026-03-26 13:02:21] ==== PHASE 1: Kernel microbenchmarks (runs=100, warmup=10) ====
+[2026-03-26 13:02:21] -- Kernel: attention (block-sizes: 16,32,64)
+python: /project/lib/Analysis/Allocation.cpp:47: std::pair<llvm::SmallVector<unsigned int>, llvm::SmallVector<unsigned int> > mlir::triton::getCvtOrder(mlir::Attribute, mlir::Attribute): Assertion `!(srcMmaLayout && dstMmaLayout && !srcMmaLayout.isAmpere()) && "mma -> mma layout conversion is only supported on Ampere"' failed.
+/var/spool/slurmd/job2235090/slurm_script: line 148: 2170320 Aborted                 python "$HW1_DIR/benchmark_kernels.py" --kernel "$kernel" --seq-lens "$SEQ_LENS_KERNEL" --block-sizes "$block_sizes" --runs "$RUNS" --warmup "$WARMUP" --save "$OUTPUT_DIR/kernels" --plot --check
+[2026-03-26 13:05:01] ERROR: command failed (exit=134) at line 153
+[2026-03-26 13:05:01] ERROR: last command: python "$HW1_DIR/benchmark_kernels.py" --kernel "$kernel" --seq-lens "$SEQ_LENS_KERNEL" --block-sizes "$block_sizes" --runs "$RUNS" --warmup "$WARMUP" --save "$OUTPUT_DIR/kernels" --plot --check
+[2026-03-26 13:05:01] ERROR: full log: /home/s2890639/projects/edin-mls-26-spring/results_kernels/run_2235090/logs/benchmark_run_2235090_20260326_130219.log
+[2026-03-26 13:05:01] Benchmark suite exited with status 134.
+[2026-03-26 13:05:01] Check log file: /home/s2890639/projects/edin-mls-26-spring/results_kernels/run_2235090/logs/benchmark_run_2235090_20260326_130219.log
