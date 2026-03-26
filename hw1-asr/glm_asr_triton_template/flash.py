@@ -21,20 +21,27 @@ def _flash_shm_budget() -> int:
 
 def _make_flash_configs(shm_budget: int, block_d: int = 128):
     """Generate valid flash attention autotune configs filtered by shared memory constraint."""
+    # On Hopper (sm_90+) Triton triggers wgmma instructions for BLOCK_M >= 64,
+    # which produces MMA layouts that this Triton version cannot convert, causing
+    # a SIGABRT in Allocation.cpp.  Restrict to BLOCK_M <= 32 on those GPUs.
+    cc = torch.cuda.get_device_capability() if torch.cuda.is_available() else (8, 0)
+    max_block_m = 32 if cc[0] >= 9 else 128
+
     candidates = [
-    triton.Config({'BLOCK_M': 16, 'BLOCK_N': 16}, num_warps=2, num_stages=1),
-    triton.Config({'BLOCK_M': 16, 'BLOCK_N': 32}, num_warps=4, num_stages=1),
-    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 16}, num_warps=4, num_stages=1),
-    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32}, num_warps=4, num_stages=1),
-    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_warps=4, num_stages=1),
-    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64}, num_warps=4, num_stages=1),
-    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_warps=8, num_stages=1),
-    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_warps=8, num_stages=1),
+    triton.Config({'BLOCK_M': 16, 'BLOCK_N': 16}, num_warps=2, num_stages=2),
+    triton.Config({'BLOCK_M': 16, 'BLOCK_N': 32}, num_warps=4, num_stages=2),
+    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 16}, num_warps=4, num_stages=2),
+    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32}, num_warps=4, num_stages=2),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_warps=4, num_stages=2),
+    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64}, num_warps=4, num_stages=2),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_warps=8, num_stages=2),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_warps=8, num_stages=2),
     ]
     # Each SM needs q_tile (BLOCK_M, BLOCK_D) + acc (BLOCK_M, BLOCK_D) + k/v tile (BLOCK_N, BLOCK_D)
     return [
         cfg for cfg in candidates
-        if (2 * cfg.kwargs['BLOCK_M'] + cfg.kwargs['BLOCK_N']) * block_d * 4 <= shm_budget
+        if cfg.kwargs['BLOCK_M'] <= max_block_m
+        and (2 * cfg.kwargs['BLOCK_M'] + cfg.kwargs['BLOCK_N']) * block_d * 4 <= shm_budget
     ]
 
 

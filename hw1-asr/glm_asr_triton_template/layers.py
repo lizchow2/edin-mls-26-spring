@@ -55,14 +55,14 @@ _LINEAR_CONFIGS = [
 
 _LINEAR_CONFIGS = [
     # Decode-path (M=1–16): small M tiles, wider N
-    triton.Config({'BLOCK_M': 16,  'BLOCK_N': 32,  'BLOCK_K': 32, 'GROUP_SIZE': 8}, num_warps=2, num_stages=2),
-    triton.Config({'BLOCK_M': 16,  'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_SIZE': 8}, num_warps=4, num_stages=2),
+    triton.Config({'BLOCK_M': 16,  'BLOCK_N': 32,  'BLOCK_K': 32, 'GROUP_SIZE': 8}, num_warps=2),
+    triton.Config({'BLOCK_M': 16,  'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_SIZE': 8}, num_warps=4),
     # Mid-range (audio encoder, moderate seq lens)
-    triton.Config({'BLOCK_M': 32,  'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_SIZE': 8}, num_warps=4, num_stages=2),
-    triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_SIZE': 8}, num_warps=4, num_stages=2),
+    triton.Config({'BLOCK_M': 32,  'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_SIZE': 8}, num_warps=4),
+    triton.Config({'BLOCK_M': 64,  'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_SIZE': 8}, num_warps=4),
     # Larger prefill
-    triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_SIZE': 8}, num_warps=8, num_stages=3),
-    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_SIZE': 8}, num_warps=8, num_stages=3),
+    triton.Config({'BLOCK_M': 64,  'BLOCK_N': 128, 'BLOCK_K': 32, 'GROUP_SIZE': 8}, num_warps=8),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64,  'BLOCK_K': 32, 'GROUP_SIZE': 8}, num_warps=8),
 ]
 
 # Configs for int8 kernel (2D grid, no GROUP_SIZE)
