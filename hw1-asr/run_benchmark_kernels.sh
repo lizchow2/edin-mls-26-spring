@@ -102,6 +102,11 @@ trap 'on_exit' EXIT
 
 
 
+# Redirect Triton JIT cache away from /tmp (resilient to shared-node /tmp contention)
+export TRITON_CACHE_DIR="$OUTPUT_DIR/.triton_cache"
+export TMPDIR="$OUTPUT_DIR/.tmp"
+mkdir -p "$TRITON_CACHE_DIR" "$TMPDIR"
+
 # Activate conda env in a non-interactive shell
 
 source /opt/conda/etc/profile.d/conda.sh
