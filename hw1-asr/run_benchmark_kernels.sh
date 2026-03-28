@@ -39,8 +39,13 @@ MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-100}
 AUDIO=${AUDIO:-$HW1_DIR/test_audio.wav}
 LIBRISPEECH_DATA_DIR=${LIBRISPEECH_DATA_DIR:-$HW1_DIR/data}
 
-# Model sweep settings
-MODEL_SWEEP_SEQ_LENS=${MODEL_SWEEP_SEQ_LENS:-10,25,50,75,100,150,200}
+# Decoder-length sweep settings
+MODEL_SWEEP_GEN_LENS=${MODEL_SWEEP_GEN_LENS:-${MODEL_SWEEP_SEQ_LENS:-10,25,50,75,100,150,200}}
+MODEL_SWEEP_SEQ_LENS=${MODEL_SWEEP_SEQ_LENS:-$MODEL_SWEEP_GEN_LENS}
+
+# Input-length sweep settings
+MODEL_INPUT_SWEEP_SECONDS=${MODEL_INPUT_SWEEP_SECONDS:-1,2,4,6,8,10,12,16,20}
+INPUT_SWEEP_MAX_NEW_TOKENS=${INPUT_SWEEP_MAX_NEW_TOKENS:-200}
 
 # Model correctness settings
 MODEL_CORRECTNESS_UTTERANCES=${MODEL_CORRECTNESS_UTTERANCES:-20}
@@ -56,6 +61,7 @@ OUTPUT_DIR=${OUTPUT_DIR:-$PROJECT_DIR/results_kernels/$RUN_NAME}
 mkdir -p "$OUTPUT_DIR/kernels"
 mkdir -p "$OUTPUT_DIR/model"
 mkdir -p "$OUTPUT_DIR/model_sweep"
+mkdir -p "$OUTPUT_DIR/model_input_sweep"
 mkdir -p "$OUTPUT_DIR/model_correctness"
 mkdir -p "$OUTPUT_DIR/reports"
 LOG_DIR="$OUTPUT_DIR/logs"
@@ -133,7 +139,10 @@ log "MODEL_WARMUP:             $MODEL_WARMUP"
 log "MAX_NEW_TOKENS:           $MAX_NEW_TOKENS"
 log "AUDIO:                    $AUDIO"
 log "LIBRISPEECH_DATA_DIR:     $LIBRISPEECH_DATA_DIR"
-log "MODEL_SWEEP_SEQ_LENS:     $MODEL_SWEEP_SEQ_LENS"
+log "MODEL_SWEEP_GEN_LENS:     $MODEL_SWEEP_GEN_LENS"
+log "MODEL_SWEEP_SEQ_LENS:     $MODEL_SWEEP_SEQ_LENS (legacy alias)"
+log "MODEL_INPUT_SWEEP_SECONDS: $MODEL_INPUT_SWEEP_SECONDS"
+log "INPUT_SWEEP_MAX_NEW_TOKENS: $INPUT_SWEEP_MAX_NEW_TOKENS"
 log "MODEL_CORRECTNESS_N:      $MODEL_CORRECTNESS_UTTERANCES"
 GIT_SHA=$(git -C "$PROJECT_DIR" rev-parse HEAD 2>/dev/null || echo "unknown")
 if [ -n "$(git -C "$PROJECT_DIR" status --porcelain 2>/dev/null)" ]; then
@@ -215,7 +224,7 @@ log "==== PHASE 1 complete. CSVs and quick plots in $OUTPUT_DIR/kernels ===="
 # Phase 2 — Model benchmark (single audio, latency breakdown)
 # ---------------------------------------------------------------------------
 
-log "==== PHASE 2: Model benchmark (audio=$AUDIO, runs=$MODEL_RUNS) ===="
+log "==== PHASE 2: Fixed-input model benchmark (audio=$AUDIO, runs=$MODEL_RUNS, max_new_tokens=$MAX_NEW_TOKENS) ===="
 
 python "$HW1_DIR/benchmark_kernels.py" \
   --kernel model \
@@ -225,30 +234,48 @@ python "$HW1_DIR/benchmark_kernels.py" \
   --max-new-tokens "$MAX_NEW_TOKENS" \
   --save "$OUTPUT_DIR/model"
 
-log "==== PHASE 2 complete ===="
+log "==== PHASE 2 complete. model_results.csv + explicit stage breakdown in $OUTPUT_DIR/model ===="
 
 # ---------------------------------------------------------------------------
-# Phase 3 — Model sweep (latency/throughput/WER/CER vs generation length)
+# Phase 3 — Decoder-length sweep (latency/throughput/WER/CER vs generation length)
 # ---------------------------------------------------------------------------
 
-log "==== PHASE 3: Model sweep (seq-lens=$MODEL_SWEEP_SEQ_LENS, runs=$MODEL_RUNS, latency speedup saved) ===="
+log "==== PHASE 3: Decoder-length sweep (gen-lens=$MODEL_SWEEP_GEN_LENS, runs=$MODEL_RUNS, latency speedup saved) ===="
 
 python "$HW1_DIR/benchmark_kernels.py" \
   --kernel model_sweep \
-  --seq-lens "$MODEL_SWEEP_SEQ_LENS" \
+  --seq-lens "$MODEL_SWEEP_GEN_LENS" \
   --runs "$MODEL_RUNS" \
   --warmup "$MODEL_WARMUP" \
   --save "$OUTPUT_DIR/model_sweep" \
   --data-dir "$LIBRISPEECH_DATA_DIR" \
   --plot
 
-log "==== PHASE 3 complete. Sweep CSV + PNGs in $OUTPUT_DIR/model_sweep ===="
+log "==== PHASE 3 complete. Decoder sweep CSV + PNGs in $OUTPUT_DIR/model_sweep ===="
 
 # ---------------------------------------------------------------------------
-# Phase 4 — Model correctness (WER/CER on N LibriSpeech utterances)
+# Phase 4 — Input-length sweep (audio context scaling)
 # ---------------------------------------------------------------------------
 
-log "==== PHASE 4: Model correctness (utterances=$MODEL_CORRECTNESS_UTTERANCES) ===="
+log "==== PHASE 4: Input-length sweep (audio-seconds=$MODEL_INPUT_SWEEP_SECONDS, runs=$MODEL_RUNS, max_new_tokens=$INPUT_SWEEP_MAX_NEW_TOKENS) ===="
+
+python "$HW1_DIR/benchmark_kernels.py" \
+  --kernel model_input_sweep \
+  --input-seconds "$MODEL_INPUT_SWEEP_SECONDS" \
+  --max-new-tokens "$INPUT_SWEEP_MAX_NEW_TOKENS" \
+  --runs "$MODEL_RUNS" \
+  --warmup "$MODEL_WARMUP" \
+  --save "$OUTPUT_DIR/model_input_sweep" \
+  --data-dir "$LIBRISPEECH_DATA_DIR" \
+  --plot
+
+log "==== PHASE 4 complete. Input sweep CSV + PNGs in $OUTPUT_DIR/model_input_sweep ===="
+
+# ---------------------------------------------------------------------------
+# Phase 5 — Model correctness (WER/CER on N LibriSpeech utterances)
+# ---------------------------------------------------------------------------
+
+log "==== PHASE 5: Model correctness (utterances=$MODEL_CORRECTNESS_UTTERANCES) ===="
 
 python "$HW1_DIR/benchmark_kernels.py" \
   --kernel model_correctness \
@@ -258,33 +285,46 @@ python "$HW1_DIR/benchmark_kernels.py" \
   --data-dir "$LIBRISPEECH_DATA_DIR" \
   --plot
 
-log "==== PHASE 4 complete. Correctness CSV + PNGs in $OUTPUT_DIR/model_correctness ===="
+log "==== PHASE 5 complete. Correctness CSV + PNGs in $OUTPUT_DIR/model_correctness ===="
 
 # ---------------------------------------------------------------------------
-# Phase 5 — plot_report.py: 4-panel reports (latency/speedup/tflops/roofline)
+# Phase 6 — plot_report.py: 4-panel reports (latency/speedup/tflops/roofline)
 # ---------------------------------------------------------------------------
 
-log "==== PHASE 5: plot_report.py — generating 4-panel reports ===="
+log "==== PHASE 6: plot_report.py — generating 4-panel reports ===="
 
 python "$HW1_DIR/plot_report.py" "$OUTPUT_DIR/kernels" --dpi 150
 
 # Copy combined report PNGs to dedicated reports/ folder for easy access
 find "$OUTPUT_DIR/kernels" -name "*_report.png" -exec cp {} "$OUTPUT_DIR/reports/" \;
 
-log "==== PHASE 5 complete. 4-panel reports in $OUTPUT_DIR/reports ===="
+log "==== PHASE 6 complete. 4-panel reports in $OUTPUT_DIR/reports ===="
 
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Phase 7 — plot_paper_figures.py: e2e + kernel speedup summary PDFs
+# ---------------------------------------------------------------------------
+
+log "==== PHASE 7: plot_paper_figures.py — generating paper figures ===="
+
+python "$HW1_DIR/plot_paper_figures.py" \
+  --results-dir "$OUTPUT_DIR" \
+  --output-dir  "$OUTPUT_DIR/figure"
+
+log "==== PHASE 7 complete. Decoder/input scaling PDFs + fixed-input stage breakdown in $OUTPUT_DIR/figure; stage summary CSV in $OUTPUT_DIR/reports ===="
+
 log "===================================="
 log "All phases complete."
-log "  model_sweep now also includes sweep_speedup.png"
 log "Results layout:"
 log "  $OUTPUT_DIR/kernels/         — per-kernel CSVs + quick latency/speedup PNGs"
-log "  $OUTPUT_DIR/reports/         — 4-panel report PNGs (latency/speedup/tflops/roofline)"
-log "  $OUTPUT_DIR/model/           — model benchmark stdout (see log)"
-log "  $OUTPUT_DIR/model_sweep/     — sweep_results.csv + 5 sweep PNGs"
+log "  $OUTPUT_DIR/reports/         — 4-panel report PNGs + stage_benchmark_summary.csv"
+log "  $OUTPUT_DIR/model/           — fixed-input benchmark + model_results.csv with stage breakdown"
+log "  $OUTPUT_DIR/model_sweep/     — decoder-length sweep CSV + PNGs"
+log "  $OUTPUT_DIR/model_input_sweep/ — audio-length sweep CSV + PNGs"
 log "  $OUTPUT_DIR/model_correctness/ — correctness_results.csv + distribution PNGs"
+log "  $OUTPUT_DIR/figure/          — e2e_decoder_scaling.*, e2e_input_scaling.*, fixed_input_stage_breakdown.*, kernel summary figures"
 log "  $OUTPUT_DIR/logs/            — full job log"
 log "===================================="

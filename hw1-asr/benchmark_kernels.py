@@ -16,6 +16,7 @@ Usage:
   python benchmark_kernels.py --kernel all --runs 10 --save results/
   python benchmark_kernels.py --kernel model --audio test_audio.wav --runs 5
   python benchmark_kernels.py --kernel model_sweep --seq-lens 64,128,256,512,1024
+  python benchmark_kernels.py --kernel model_input_sweep --input-seconds 1,2,4,8,16
 """
 
 import argparse
@@ -1920,61 +1921,423 @@ def _decode_transcription(processor, output):
     return ""
 
 
-def _profile_component_timings(call_fn) -> Dict[str, float]:
-    """Run call_fn under torch.profiler and return per-module CUDA time (ms)."""
-    try:
-        import torch.profiler as tp
-        activities = [tp.ProfilerActivity.CPU]
-        if torch.cuda.is_available():
-            activities.append(tp.ProfilerActivity.CUDA)
-        with tp.profile(activities=activities, with_modules=True,
-                        record_shapes=False) as prof:
-            call_fn()
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+_MODEL_STAGE_KEYS = [
+    "audio_encoder_ms",
+    "projector_ms",
+    "encode_total_ms",
+    "prefill_ms",
+    "decode_step_ms",
+    "decode_total_ms",
+    "stage_sum_ms",
+]
 
-        timings: Dict[str, float] = {}
-        for evt in prof.key_averages(group_by_input_shape=False):
-            name = evt.key
-            cuda_ms = (evt.self_cuda_time_total / 1000.0
-                       if torch.cuda.is_available() else evt.self_cpu_time_total / 1000.0)
-            if cuda_ms > 0.01:
-                timings[name] = timings.get(name, 0.0) + cuda_ms
-        return timings
-    except Exception as e:
-        print(f"    [profiler] skipped: {e}")
-        return {}
+_MODEL_INPUT_META_KEYS = [
+    "raw_input_frames",
+    "used_input_frames",
+    "valid_input_frames",
+    "input_trimmed",
+    "encoder_ctx_tokens",
+]
 
 
-def _aggregate_component_timings(timings: Dict[str, float]) -> Dict[str, float]:
-    """Group raw profiler keys into high-level model components."""
-    groups = {
-        "conv_subsampler": [],
-        "audio_encoder":   [],
-        "projector":       [],
-        "text_decoder":    [],
-        "embedding":       [],
-        "other":           [],
+def _select_generate_fn(model):
+    return getattr(model, "generate_v8b",
+           getattr(model, "generate_v8",
+           getattr(model, "generate_v6", model.generate)))
+
+
+def _valid_input_frame_count(
+    input_features: torch.Tensor,
+    input_features_mask: Optional[torch.Tensor],
+) -> int:
+    if input_features_mask is None:
+        return int(input_features.shape[-1])
+    return max(1, int(torch.sum(input_features_mask[0]).item()))
+
+
+def _trim_model_runtime_inputs(
+    input_features: torch.Tensor,
+    input_features_mask: Optional[torch.Tensor],
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Dict[str, int]]:
+    """Trim padded audio frames when a valid-frame mask is available."""
+    raw_input_frames = int(input_features.shape[-1])
+    valid_input_frames = _valid_input_frame_count(input_features, input_features_mask)
+    used_input_frames = min(raw_input_frames, valid_input_frames)
+    input_trimmed = int(used_input_frames < raw_input_frames)
+
+    trimmed_features = input_features[..., :used_input_frames].contiguous()
+    trimmed_mask = input_features_mask
+    if input_features_mask is not None:
+        trimmed_mask = input_features_mask[..., :used_input_frames].contiguous()
+
+    return trimmed_features, trimmed_mask, {
+        "raw_input_frames": raw_input_frames,
+        "used_input_frames": int(trimmed_features.shape[-1]),
+        "valid_input_frames": valid_input_frames,
+        "input_trimmed": input_trimmed,
     }
-    for key, ms in timings.items():
-        kl = key.lower()
-        if any(x in kl for x in ["conv1d", "im2col", "conv_sub"]):
-            groups["conv_subsampler"].append(ms)
-        elif any(x in kl for x in ["audio", "encoder"]):
-            groups["audio_encoder"].append(ms)
-        elif "project" in kl:
-            groups["projector"].append(ms)
-        elif any(x in kl for x in ["decoder", "text", "generate", "lm_head", "embed_tokens"]):
-            groups["text_decoder"].append(ms)
-        elif "embed" in kl:
-            groups["embedding"].append(ms)
+
+
+def _call_generate(generate_fn, input_features, input_ids, input_features_mask,
+                   max_new_tokens: int, temperature: float = 1.0, top_k: int = 1):
+    kw = dict(
+        input_features=input_features,
+        input_ids=input_ids,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        top_k=top_k,
+    )
+    if input_features_mask is not None:
+        kw["input_features_mask"] = input_features_mask
+    try:
+        return generate_fn(**kw)
+    except TypeError:
+        kw.pop("input_features_mask", None)
+        return generate_fn(**kw)
+
+
+def _call_encode_audio(model, input_features, input_features_mask):
+    try:
+        return model.encode_audio(input_features, input_features_mask)
+    except TypeError:
+        return model.encode_audio(input_features)
+
+
+def _build_generate_inputs(model, audio_embeds: torch.Tensor, input_ids: Optional[torch.Tensor],
+                           audio_pad_token_id: int = 59260):
+    if input_ids is not None:
+        batch_size = input_ids.shape[0]
+
+        if audio_embeds.ndim == 3:
+            audio_embeds = audio_embeds[0]
+
+        text_embeds = model.text_decoder.embed_tokens(input_ids)
+        audio_mask = (input_ids == audio_pad_token_id)
+        audio_positions = torch.where(audio_mask[0])[0]
+
+        if len(audio_positions) > 0:
+            first_pad_pos = int(audio_positions[0].item())
+            last_pad_pos = int(audio_positions[-1].item())
+
+            before_audio = text_embeds[0, :first_pad_pos, :]
+            after_audio = text_embeds[0, last_pad_pos + 1:, :]
+            inputs_embeds = torch.cat(
+                [
+                    before_audio[None, :, :],
+                    audio_embeds[None, :, :],
+                    after_audio[None, :, :],
+                ],
+                dim=1,
+            )
         else:
-            groups["other"].append(ms)
-    return {k: sum(v) for k, v in groups.items() if v}
+            inputs_embeds = text_embeds
+
+        generated = input_ids.clone()
+    else:
+        batch_size = audio_embeds.shape[0] if audio_embeds.ndim == 3 else 1
+        if audio_embeds.ndim == 2:
+            audio_embeds = audio_embeds[None, :, :]
+        inputs_embeds = audio_embeds
+        generated = torch.full(
+            (batch_size, 1),
+            model.config.bos_token_id,
+            dtype=torch.int64,
+            device=inputs_embeds.device,
+        )
+
+    return batch_size, inputs_embeds, generated
+
+
+def _eos_token_tensor(model, device: torch.device) -> torch.Tensor:
+    eos_token_ids = model.config.eos_token_id
+    if isinstance(eos_token_ids, int):
+        eos_token_ids = [eos_token_ids]
+    return torch.tensor(eos_token_ids, dtype=torch.int64, device=device)
+
+
+def _sample_next_token(logits: torch.Tensor, temperature: float = 1.0,
+                       top_k: int = 1) -> torch.Tensor:
+    next_token_logits = logits[:, -1, :] / temperature
+    batch_size = next_token_logits.shape[0]
+
+    if top_k > 0 and top_k < next_token_logits.shape[-1]:
+        top_k_indices = torch.argsort(next_token_logits, dim=-1)[:, -top_k:]
+        top_k_logits = torch.gather(next_token_logits, dim=-1, index=top_k_indices)
+
+        top_k_logits_shifted = top_k_logits - torch.max(
+            top_k_logits, dim=-1, keepdim=True
+        ).values
+        exp_logits = torch.exp(top_k_logits_shifted)
+        probs = exp_logits / torch.sum(exp_logits, dim=-1, keepdim=True)
+
+        cumprobs = torch.cumsum(probs, dim=-1)
+        samples = torch.rand((batch_size, 1), device=next_token_logits.device)
+        next_token_idx = torch.argmax((cumprobs >= samples).to(torch.float32), dim=-1)
+        return torch.gather(
+            top_k_indices,
+            dim=-1,
+            index=next_token_idx[:, None],
+        )
+
+    return torch.argmax(next_token_logits, dim=-1, keepdim=True)
+
+
+def _update_finished(next_token: torch.Tensor, finished: torch.Tensor,
+                     eos_token_ids: torch.Tensor) -> torch.Tensor:
+    next_token_flat = next_token.flatten()
+    is_eos = torch.any(next_token_flat[:, None] == eos_token_ids[None, :], dim=1)
+    return finished | is_eos
+
+
+def _run_generation_stage_once(
+    model,
+    input_features: torch.Tensor,
+    input_ids: Optional[torch.Tensor],
+    input_features_mask: Optional[torch.Tensor],
+    max_new_tokens: int,
+    generation_mode: str,
+    temperature: float = 1.0,
+    top_k: int = 1,
+    audio_pad_token_id: int = 59260,
+) -> Dict[str, Any]:
+    encode_total_timer = TorchTimer()
+    encode_total_timer.start()
+    audio_embeds = _call_encode_audio(model, input_features, input_features_mask)
+    encode_total_ms = encode_total_timer.stop()
+
+    if max_new_tokens <= 0:
+        batch_size, _, generated = _build_generate_inputs(
+            model, audio_embeds, input_ids, audio_pad_token_id=audio_pad_token_id
+        )
+        return {
+            "output": generated,
+            "encode_total_ms": encode_total_ms,
+            "prefill_ms": 0.0,
+            "decode_step_ms": 0.0,
+            "decode_total_ms": 0.0,
+            "stage_sum_ms": encode_total_ms,
+        }
+
+    prefill_timer = TorchTimer()
+    prefill_timer.start()
+    batch_size, inputs_embeds, generated = _build_generate_inputs(
+        model, audio_embeds, input_ids, audio_pad_token_id=audio_pad_token_id
+    )
+    finished = torch.zeros(batch_size, dtype=torch.bool, device=generated.device)
+    eos_token_ids = _eos_token_tensor(model, generated.device)
+
+    past_key_values = None
+    if generation_mode == "template":
+        logits, past_key_values = model.decode(
+            inputs_embeds=inputs_embeds,
+            use_cache=True,
+        )
+        next_token = _sample_next_token(logits, temperature=temperature, top_k=top_k)
+        generated = torch.cat([generated, next_token], dim=1)
+        finished = _update_finished(next_token, finished, eos_token_ids)
+    else:
+        logits = model.decode(inputs_embeds=inputs_embeds)
+        next_token = _sample_next_token(logits, temperature=temperature, top_k=top_k)
+        generated = torch.cat([generated, next_token], dim=1)
+        finished = _update_finished(next_token, finished, eos_token_ids)
+        if not torch.all(finished):
+            new_embeds = model.text_decoder.embed_tokens(next_token)
+            inputs_embeds = torch.cat([inputs_embeds, new_embeds], dim=1)
+
+    prefill_ms = prefill_timer.stop()
+
+    decode_times: List[float] = []
+    for _ in range(max_new_tokens - 1):
+        if torch.all(finished):
+            break
+
+        decode_timer = TorchTimer()
+        decode_timer.start()
+
+        if generation_mode == "template":
+            new_embeds = model.text_decoder.embed_tokens(next_token)
+            logits, past_key_values = model.decode(
+                inputs_embeds=new_embeds,
+                use_cache=True,
+                past_key_values=past_key_values,
+            )
+            next_token = _sample_next_token(logits, temperature=temperature, top_k=top_k)
+            generated = torch.cat([generated, next_token], dim=1)
+            finished = _update_finished(next_token, finished, eos_token_ids)
+        else:
+            logits = model.decode(inputs_embeds=inputs_embeds)
+            next_token = _sample_next_token(logits, temperature=temperature, top_k=top_k)
+            generated = torch.cat([generated, next_token], dim=1)
+            finished = _update_finished(next_token, finished, eos_token_ids)
+            if not torch.all(finished):
+                new_embeds = model.text_decoder.embed_tokens(next_token)
+                inputs_embeds = torch.cat([inputs_embeds, new_embeds], dim=1)
+
+        decode_times.append(decode_timer.stop())
+
+    decode_total_ms = float(np.sum(decode_times)) if decode_times else 0.0
+    decode_step_ms = float(np.mean(decode_times)) if decode_times else 0.0
+    return {
+        "output": generated,
+        "encode_total_ms": encode_total_ms,
+        "prefill_ms": prefill_ms,
+        "decode_step_ms": decode_step_ms,
+        "decode_total_ms": decode_total_ms,
+        "stage_sum_ms": encode_total_ms + prefill_ms + decode_total_ms,
+    }
+
+
+def _measure_operator_stage_timings(
+    model,
+    input_features: torch.Tensor,
+    input_features_mask: Optional[torch.Tensor],
+    warmup: int,
+    runs: int,
+) -> Dict[str, float]:
+    audio_encoder_times = timed_run(
+        lambda: model.audio_encoder(input_features),
+        warmup=warmup,
+        runs=runs,
+    )
+    audio_features = model.audio_encoder(input_features)
+    projector_times = timed_run(
+        lambda: model.multi_modal_projector(audio_features),
+        warmup=warmup,
+        runs=runs,
+    )
+    encode_total_times = timed_run(
+        lambda: _call_encode_audio(model, input_features, input_features_mask),
+        warmup=warmup,
+        runs=runs,
+    )
+    return {
+        "audio_encoder_ms": float(np.mean(audio_encoder_times)),
+        "projector_ms": float(np.mean(projector_times)),
+        "encode_total_ms": float(np.mean(encode_total_times)),
+    }
+
+
+def _measure_generation_stage_timings(
+    model,
+    input_features: torch.Tensor,
+    input_ids: Optional[torch.Tensor],
+    input_features_mask: Optional[torch.Tensor],
+    max_new_tokens: int,
+    generation_mode: str,
+    warmup: int,
+    runs: int,
+    temperature: float = 1.0,
+    top_k: int = 1,
+    audio_pad_token_id: int = 59260,
+) -> Dict[str, float]:
+    for _ in range(warmup):
+        _run_generation_stage_once(
+            model,
+            input_features,
+            input_ids,
+            input_features_mask,
+            max_new_tokens=max_new_tokens,
+            generation_mode=generation_mode,
+            temperature=temperature,
+            top_k=top_k,
+            audio_pad_token_id=audio_pad_token_id,
+        )
+
+    prefill_times: List[float] = []
+    decode_step_times: List[float] = []
+    decode_total_times: List[float] = []
+    for _ in range(runs):
+        timed_output = _run_generation_stage_once(
+            model,
+            input_features,
+            input_ids,
+            input_features_mask,
+            max_new_tokens=max_new_tokens,
+            generation_mode=generation_mode,
+            temperature=temperature,
+            top_k=top_k,
+            audio_pad_token_id=audio_pad_token_id,
+        )
+        prefill_times.append(timed_output["prefill_ms"])
+        decode_step_times.append(timed_output["decode_step_ms"])
+        decode_total_times.append(timed_output["decode_total_ms"])
+
+    return {
+        "prefill_ms": float(np.mean(prefill_times)) if prefill_times else 0.0,
+        "decode_step_ms": float(np.mean(decode_step_times)) if decode_step_times else 0.0,
+        "decode_total_ms": float(np.mean(decode_total_times)) if decode_total_times else 0.0,
+    }
+
+
+def _measure_model_stage_timings(
+    model,
+    input_features: torch.Tensor,
+    input_ids: Optional[torch.Tensor],
+    input_features_mask: Optional[torch.Tensor],
+    max_new_tokens: int,
+    generation_mode: str,
+    warmup: int,
+    runs: int,
+) -> Dict[str, float]:
+    fixed_stages = _measure_operator_stage_timings(
+        model,
+        input_features,
+        input_features_mask,
+        warmup=warmup,
+        runs=runs,
+    )
+    generation_stages = _measure_generation_stage_timings(
+        model,
+        input_features,
+        input_ids,
+        input_features_mask,
+        max_new_tokens=max_new_tokens,
+        generation_mode=generation_mode,
+        warmup=warmup,
+        runs=runs,
+    )
+    return {
+        **fixed_stages,
+        **generation_stages,
+        "stage_sum_ms": (
+            fixed_stages["encode_total_ms"]
+            + generation_stages["prefill_ms"]
+            + generation_stages["decode_total_ms"]
+        ),
+    }
+
+
+def _save_model_results_csv(results: Dict[str, Dict[str, Any]], out_dir: str):
+    import csv
+
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, "model_results.csv")
+    fields = [
+        "label",
+        "mean",
+        "median",
+        "std",
+        "min",
+        "max",
+        "tok_per_sec",
+        "peak_mem_mb",
+        "n_generated",
+        *_MODEL_INPUT_META_KEYS,
+        *_MODEL_STAGE_KEYS,
+        "transcription",
+    ]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        for label in ["template", "example"]:
+            if label not in results:
+                continue
+            writer.writerow({"label": label, **results[label]})
+    print(f"  Saved: {path}")
 
 
 def benchmark_model(audio_path: str, warmup: int = 2, runs: int = 5,
-                    max_new_tokens: int = 50):
+                    max_new_tokens: int = 50, save_dir: Optional[str] = None):
     """Load template and example models, benchmark generate() side by side."""
     print("\n" + "=" * 72)
     print("MODEL BENCHMARK: glm_asr_triton_template vs glm_asr_triton_example")
@@ -1993,56 +2356,32 @@ def benchmark_model(audio_path: str, warmup: int = 2, runs: int = 5,
     print(f"  {duration:.2f}s @ 16kHz, {len(audio)} samples")
 
     device = _device()
-    results = {}
+    results: Dict[str, Dict[str, Any]] = {}
 
     for folder, label in [(_TEMPLATE_DIR, "template"), (_EXAMPLE_DIR, "example")]:
         print(f"\n[{label}] Loading model from {os.path.basename(folder)}...")
-        if folder not in sys.path:
-            sys.path.insert(0, folder)
-        for mod_name in list(sys.modules.keys()):
-            if mod_name in ["weight_loader", "model", "layers", "attention",
-                            "flash", "rope", "conv"]:
-                del sys.modules[mod_name]
+        _model_load(folder)
 
         try:
             from weight_loader import load_model_from_hf
             model, processor = load_model_from_hf("zai-org/GLM-ASR-Nano-2512")
-
-            # Prepare inputs
-            if hasattr(processor, "apply_transcription_request"):
-                inputs = processor.apply_transcription_request(audio)
-                input_features = inputs.input_features.to(device=device, dtype=torch.float32)
-                input_ids      = inputs.input_ids.to(device=device, dtype=torch.int64)
-                input_features_mask = None
-                if hasattr(inputs, "input_features_mask") and inputs.input_features_mask is not None:
-                    input_features_mask = inputs.input_features_mask.to(device=device, dtype=torch.float32)
-            else:
-                feats = processor(audio, sampling_rate=16000, return_tensors="pt", padding="max_length")
-                input_features = feats["input_features"].to(device=device, dtype=torch.float32)
-                mel_frames = input_features.shape[-1]
-                num_audio_tokens = max(1, mel_frames // 2 // 4)
-                input_ids = torch.tensor(
-                    [[59253, 10, 59261] + [59260] * num_audio_tokens + [59262, 59253, 10, 9249, 70891, 419, 7122, 1119, 1467, 59254, 10]],
-                    dtype=torch.int64, device=device,
-                )
-                input_features_mask = None
-
-            generate_fn = getattr(model, "generate_v8b",
-                          getattr(model, "generate_v8",
-                          getattr(model, "generate_v6", model.generate)))
+            input_features, input_ids, input_features_mask, input_meta = _prepare_model_benchmark_inputs(
+                processor,
+                audio,
+                device,
+            )
+            generate_fn = _select_generate_fn(model)
 
             def _call():
-                kw = dict(input_features=input_features,
-                          input_ids=input_ids,
-                          max_new_tokens=max_new_tokens,
-                          temperature=1.0, top_k=1)
-                if input_features_mask is not None:
-                    kw["input_features_mask"] = input_features_mask
-                try:
-                    return generate_fn(**kw)
-                except TypeError:
-                    kw.pop("input_features_mask", None)
-                    return generate_fn(**kw)
+                return _call_generate(
+                    generate_fn,
+                    input_features,
+                    input_ids,
+                    input_features_mask,
+                    max_new_tokens=max_new_tokens,
+                    temperature=1.0,
+                    top_k=1,
+                )
 
             print(f"  Warming up ({warmup} runs)...")
             for _ in range(warmup):
@@ -2072,10 +2411,17 @@ def benchmark_model(audio_path: str, warmup: int = 2, runs: int = 5,
             mean_ms = stats["mean"]
             tok_per_sec = total_generated / total_time_s if total_time_s > 0 else float("nan")
 
-            # Per-component profiler pass (one call, not in timing loop)
-            print(f"  Profiling components...")
-            component_timings = _profile_component_timings(_call)
-            component_groups  = _aggregate_component_timings(component_timings)
+            print("  Measuring stage timings...")
+            stage_timings = _measure_model_stage_timings(
+                model,
+                input_features,
+                input_ids,
+                input_features_mask,
+                max_new_tokens=max_new_tokens,
+                generation_mode=label,
+                warmup=warmup,
+                runs=runs,
+            )
 
             results[label] = {
                 "mean": mean_ms,
@@ -2087,30 +2433,42 @@ def benchmark_model(audio_path: str, warmup: int = 2, runs: int = 5,
                 "peak_mem_mb": peak_mem_mb,
                 "n_generated": avg_generated,
                 "transcription": transcription,
-                "components": component_groups,
+                **input_meta,
+                **stage_timings,
             }
             print(f"  Mean: {mean_ms:.1f}ms ± {np.std(times):.1f}ms  "
                   f"[{np.min(times):.1f}–{np.max(times):.1f}ms]  "
                   f"{tok_per_sec:.1f} tok/s")
             print(f"  Peak GPU mem: {peak_mem_mb:.0f} MB")
+            print(
+                "  Input: "
+                f"raw_frames={input_meta['raw_input_frames']}  "
+                f"used_frames={input_meta['used_input_frames']}  "
+                f"valid_frames={input_meta['valid_input_frames']}  "
+                f"trimmed={input_meta['input_trimmed']}  "
+                f"ctx={input_meta['encoder_ctx_tokens']} toks"
+            )
+            print(
+                "  Stages: "
+                f"encode={stage_timings['encode_total_ms']:.2f}ms  "
+                f"prefill={stage_timings['prefill_ms']:.2f}ms  "
+                f"decode_step={stage_timings['decode_step_ms']:.2f}ms  "
+                f"decode_total={stage_timings['decode_total_ms']:.2f}ms"
+            )
             print(f"  Transcription: \"{transcription}\"")
 
         except Exception as e:
             print(f"  ERROR loading/running {label}: {e}")
             import traceback; traceback.print_exc()
         finally:
-            if folder in sys.path:
-                sys.path.remove(folder)
             try:
                 del model
+                del processor
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             except Exception:
                 pass
-            for mod_name in list(sys.modules.keys()):
-                if mod_name in ["weight_loader", "model", "layers", "attention",
-                                "flash", "rope", "conv"]:
-                    del sys.modules[mod_name]
+            _model_unload(folder)
 
     # Summary
     print("\n" + "=" * 72)
@@ -2158,26 +2516,37 @@ def benchmark_model(audio_path: str, warmup: int = 2, runs: int = 5,
     if len(labels_present) == 2:
         print("Note: latency speedup uses median latency; throughput speedup uses tok/s.")
 
-    # Per-component breakdown
-    all_components = sorted({c for l in labels_present for c in results[l].get("components", {})})
-    if all_components:
-        print(f"\n{'─'*72}")
-        print("Per-Component CUDA Time (ms) — single profiled pass")
-        print(f"{'─'*72}")
-        print(f"{'Component':<24s}" + "".join(f"{l:>{col_w}s}" for l in labels_present)
-              + (f"{'speedup':>{col_w}s}" if len(labels_present) == 2 else ""))
-        print("-" * (24 + col_w * (len(labels_present) + (1 if len(labels_present) == 2 else 0))))
-        for comp in all_components:
-            vals = [results[l].get("components", {}).get(comp, float("nan")) for l in labels_present]
-            row = f"{comp:<24s}" + "".join(f"{v:{col_w}.2f}" if not math.isnan(v) else f"{'N/A':>{col_w}s}" for v in vals)
-            if len(labels_present) == 2 and not any(math.isnan(v) for v in vals) and vals[0] > 0:
-                row += f"{vals[1] / vals[0]:{col_w}.2f}x"
-            print(row)
+    print(f"\n{'─'*72}")
+    print("Explicit Stage Timing (ms)")
+    print(f"{'─'*72}")
+    print(f"{'Stage':<24s}" + "".join(f"{l:>{col_w}s}" for l in labels_present)
+          + (f"{'speedup':>{col_w}s}" if len(labels_present) == 2 else ""))
+    print("-" * (24 + col_w * (len(labels_present) + (1 if len(labels_present) == 2 else 0))))
+    for stage_key, stage_label in [
+        ("audio_encoder_ms", "audio_encoder"),
+        ("projector_ms", "projector"),
+        ("encode_total_ms", "encode_total"),
+        ("prefill_ms", "prefill"),
+        ("decode_step_ms", "decode_step"),
+        ("decode_total_ms", "decode_total"),
+        ("stage_sum_ms", "stage_sum"),
+    ]:
+        vals = [results[l].get(stage_key, float("nan")) for l in labels_present]
+        row = f"{stage_label:<24s}" + "".join(
+            f"{v:{col_w}.2f}" if not math.isnan(v) else f"{'N/A':>{col_w}s}"
+            for v in vals
+        )
+        if len(labels_present) == 2 and not any(math.isnan(v) for v in vals) and vals[0] > 0:
+            row += f"{vals[1] / vals[0]:{col_w}.2f}x"
+        print(row)
 
     # Transcriptions
     print(f"\n{'─'*72}")
     for l in labels_present:
         print(f"Transcription ({l}): \"{results[l].get('transcription', '')}\"")
+
+    if save_dir:
+        _save_model_results_csv(results, save_dir)
 
     # Single-model fallback
     if len(labels_present) == 1:
@@ -2197,6 +2566,28 @@ _LIBRISPEECH_DATA_DIR = os.path.join(_SCRIPT_DIR, "data")
 #   mel hop_length=160  →  conv stride=2  →  frame pool×4
 #   => samples_per_audio_token = 160 * 2 * 4 = 1280
 _SAMPLES_PER_TOKEN = 1280
+
+
+def _post_encoder_lengths(frame_lengths: torch.Tensor) -> torch.Tensor:
+    """Map valid mel-frame counts to post-projector audio token counts."""
+    audio_lengths = frame_lengths.to(dtype=torch.int64)
+    for padding, kernel_size, stride in [(1, 3, 1), (1, 3, 2)]:
+        audio_lengths = (audio_lengths + 2 * padding - (kernel_size - 1) - 1) // stride + 1
+    merge_factor = 4
+    post_lengths = (audio_lengths - merge_factor) // merge_factor + 1
+    return torch.clamp(post_lengths, min=0)
+
+
+def _estimate_encoder_ctx_tokens(
+    input_features_mask: Optional[torch.Tensor],
+    n_audio_samples: int,
+) -> int:
+    """Estimate the effective encoder context length for one audio example."""
+    if input_features_mask is not None:
+        valid_frames = torch.sum(input_features_mask, dim=-1)
+        post_lengths = _post_encoder_lengths(valid_frames)
+        return max(1, int(post_lengths.flatten()[0].item()))
+    return max(1, int(math.ceil(float(n_audio_samples) / float(_SAMPLES_PER_TOKEN))))
 
 
 def _load_librispeech_samples(data_dir: str, max_samples_needed: int):
@@ -2292,7 +2683,12 @@ def _load_librispeech_utterances(data_dir: str, n: int = 15):
     return utterances
 
 
-def _prepare_inputs(processor, audio: np.ndarray, device: torch.device):
+def _prepare_inputs(
+    processor,
+    audio: np.ndarray,
+    device: torch.device,
+    pad_to_max_length: bool = True,
+):
     """Prepare model inputs from a raw audio array; return (input_features, input_ids, mask)."""
     if hasattr(processor, "apply_transcription_request"):
         inputs = processor.apply_transcription_request(audio)
@@ -2302,7 +2698,10 @@ def _prepare_inputs(processor, audio: np.ndarray, device: torch.device):
         if hasattr(inputs, "input_features_mask") and inputs.input_features_mask is not None:
             mask = inputs.input_features_mask.to(device=device, dtype=torch.float32)
     else:
-        feats = processor(audio, sampling_rate=16000, return_tensors="pt", padding="max_length")
+        proc_kwargs = dict(sampling_rate=16000, return_tensors="pt")
+        if pad_to_max_length:
+            proc_kwargs["padding"] = "max_length"
+        feats = processor(audio, **proc_kwargs)
         input_features = feats["input_features"].to(device=device, dtype=torch.float32)
         mel_frames = input_features.shape[-1]
         num_audio_tokens = max(1, mel_frames // 2 // 4)
@@ -2312,6 +2711,24 @@ def _prepare_inputs(processor, audio: np.ndarray, device: torch.device):
         )
         mask = None
     return input_features, input_ids, mask
+
+
+def _prepare_model_benchmark_inputs(
+    processor,
+    audio: np.ndarray,
+    device: torch.device,
+    pad_to_max_length: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Dict[str, Any]]:
+    """Prepare and trim model-mode inputs, returning additive input-shape metadata."""
+    input_features, input_ids, mask = _prepare_inputs(
+        processor,
+        audio,
+        device,
+        pad_to_max_length=pad_to_max_length,
+    )
+    input_features, mask, meta = _trim_model_runtime_inputs(input_features, mask)
+    meta["encoder_ctx_tokens"] = _estimate_encoder_ctx_tokens(mask, len(audio))
+    return input_features, input_ids, mask, meta
 
 
 def _model_unload(folder):
@@ -2388,7 +2805,11 @@ def benchmark_model_correctness(
 
             for utt_idx, (audio, reference) in enumerate(utterances):
                 duration = len(audio) / 16000
-                input_features, input_ids, mask = _prepare_inputs(processor, audio, device)
+                input_features, input_ids, mask, _input_meta = _prepare_model_benchmark_inputs(
+                    processor,
+                    audio,
+                    device,
+                )
 
                 kw = dict(input_features=input_features,
                           input_ids=input_ids,
@@ -2567,31 +2988,56 @@ def benchmark_model_sweep(
         try:
             from weight_loader import load_model_from_hf
             model, processor = load_model_from_hf("zai-org/GLM-ASR-Nano-2512")
-            generate_fn = getattr(model, "generate_v8b",
-                          getattr(model, "generate_v8",
-                          getattr(model, "generate_v6", model.generate)))
+            generate_fn = _select_generate_fn(model)
 
             # Fixed inputs — prepared once outside the gen_len loop
-            input_features, input_ids, mask = _prepare_inputs(processor, audio_clip, device)
-            actual_ctx_len = int((input_features.shape[-1] // 2) // 4)
+            input_features, input_ids, mask, fixed_input_meta = _prepare_model_benchmark_inputs(
+                processor,
+                audio_clip,
+                device,
+            )
+            actual_ctx_len = fixed_input_meta["encoder_ctx_tokens"]
             reference_text = _get_reference(_segments, n_fixed)
             print(f"  Fixed audio: {n_fixed/16000:.1f}s | encoder ctx: {actual_ctx_len} tokens")
+            print(
+                "  Input: "
+                f"raw_frames={fixed_input_meta['raw_input_frames']}  "
+                f"used_frames={fixed_input_meta['used_input_frames']}  "
+                f"valid_frames={fixed_input_meta['valid_input_frames']}  "
+                f"trimmed={fixed_input_meta['input_trimmed']}"
+            )
+
+            fixed_stage_metrics = _measure_model_stage_timings(
+                model,
+                input_features,
+                input_ids,
+                mask,
+                max_new_tokens=1,
+                generation_mode=label,
+                warmup=warmup,
+                runs=runs,
+            )
+            print(
+                "  Fixed stages: "
+                f"audio_encoder={fixed_stage_metrics['audio_encoder_ms']:.2f}ms  "
+                f"projector={fixed_stage_metrics['projector_ms']:.2f}ms  "
+                f"encode_total={fixed_stage_metrics['encode_total_ms']:.2f}ms  "
+                f"prefill={fixed_stage_metrics['prefill_ms']:.2f}ms"
+            )
 
             label_results: List[dict] = []
 
             for gen_len in target_gen_lens:
                 def _call(gen_len=gen_len):
-                    kw = dict(input_features=input_features,
-                              input_ids=input_ids,
-                              max_new_tokens=gen_len,
-                              temperature=1.0, top_k=1)
-                    if mask is not None:
-                        kw["input_features_mask"] = mask
-                    try:
-                        return generate_fn(**kw)
-                    except TypeError:
-                        kw.pop("input_features_mask", None)
-                        return generate_fn(**kw)
+                    return _call_generate(
+                        generate_fn,
+                        input_features,
+                        input_ids,
+                        mask,
+                        max_new_tokens=gen_len,
+                        temperature=1.0,
+                        top_k=1,
+                    )
 
                 print(f"  gen_len={gen_len:4d}  warming up...", end="", flush=True)
                 for _ in range(warmup):
@@ -2619,8 +3065,30 @@ def benchmark_model_sweep(
                 mean_ms = stats["mean"]
                 tok_per_sec = total_generated / total_time_s if total_time_s > 0 else float("nan")
                 ms_per_tok = mean_ms / avg_generated if avg_generated > 0 else float("nan")
+                decode_stage_metrics = _measure_generation_stage_timings(
+                    model,
+                    input_features,
+                    input_ids,
+                    mask,
+                    max_new_tokens=gen_len,
+                    generation_mode=label,
+                    warmup=warmup,
+                    runs=runs,
+                )
+                stage_sum_ms = (
+                    fixed_stage_metrics["encode_total_ms"]
+                    + fixed_stage_metrics["prefill_ms"]
+                    + decode_stage_metrics["decode_total_ms"]
+                )
 
                 print(f"  {mean_ms:.1f}ms  {tok_per_sec:.1f}tok/s  {ms_per_tok:.2f}ms/tok  {peak_mem:.0f}MB")
+                print(
+                    "    stages: "
+                    f"encode={fixed_stage_metrics['encode_total_ms']:.2f}ms  "
+                    f"prefill={fixed_stage_metrics['prefill_ms']:.2f}ms  "
+                    f"decode_step={decode_stage_metrics['decode_step_ms']:.2f}ms  "
+                    f"decode_total={decode_stage_metrics['decode_total_ms']:.2f}ms"
+                )
                 _show = lambda s, n=200: s[:n] + "..." if len(s) > n else s
                 print(f"    hyp ({len(hypothesis_text.split()):3d} words): {_show(hypothesis_text)}")
                 print(f"    WER={wer:.3f}  CER={cer:.3f}")
@@ -2636,8 +3104,16 @@ def benchmark_model_sweep(
                     "ms_per_tok":  ms_per_tok,
                     "peak_mem_mb": peak_mem,
                     "n_generated": avg_generated,
+                    **fixed_input_meta,
                     "wer":         wer,
                     "cer":         cer,
+                    "audio_encoder_ms": fixed_stage_metrics["audio_encoder_ms"],
+                    "projector_ms": fixed_stage_metrics["projector_ms"],
+                    "encode_total_ms": fixed_stage_metrics["encode_total_ms"],
+                    "prefill_ms": fixed_stage_metrics["prefill_ms"],
+                    "decode_step_ms": decode_stage_metrics["decode_step_ms"],
+                    "decode_total_ms": decode_stage_metrics["decode_total_ms"],
+                    "stage_sum_ms": stage_sum_ms,
                     "hypothesis":  hypothesis_text,
                     "reference":   reference_text,
                 })
@@ -2690,6 +3166,13 @@ def benchmark_model_sweep(
         ("tok_per_sec", "Throughput (tok/s)",      ".1f"),
         ("ms_per_tok",  "Latency/token (ms/tok)", ".2f"),
         ("peak_mem_mb", "Peak GPU mem (MB)",       ".0f"),
+        ("audio_encoder_ms", "Audio encoder (ms)", ".2f"),
+        ("projector_ms", "Projector (ms)",         ".2f"),
+        ("encode_total_ms", "Encode total (ms)",   ".2f"),
+        ("prefill_ms", "Prefill (ms)",             ".2f"),
+        ("decode_step_ms", "Decode step (ms)",     ".2f"),
+        ("decode_total_ms", "Decode total (ms)",   ".2f"),
+        ("stage_sum_ms", "Stage sum (ms)",         ".2f"),
         ("wer",         "WER",                     ".3f"),
         ("cer",         "CER",                     ".3f"),
     ]:
@@ -2710,8 +3193,14 @@ def benchmark_model_sweep(
             vals = [rows_by_gl[gl].get(l, float("nan")) for l in labels_present]
             row += "".join(_val(v, fmt) for v in vals)
             if has_both and not any(math.isnan(v) for v in vals):
-                if metric_key in ("mean", "median"):
+                if metric_key in (
+                    "mean", "median", "audio_encoder_ms", "projector_ms",
+                    "encode_total_ms", "prefill_ms", "decode_step_ms",
+                    "decode_total_ms", "stage_sum_ms",
+                ):
                     spd = latency_speedup_by_gl.get(gl, float("nan"))
+                    if metric_key != "mean" and metric_key != "median" and vals[0] > 0:
+                        spd = vals[1] / vals[0]
                 elif metric_key in ("ms_per_tok",):
                     spd = vals[1] / vals[0] if vals[0] > 0 else float("nan")
                 elif metric_key in ("tok_per_sec",):
@@ -2723,7 +3212,7 @@ def benchmark_model_sweep(
             print(row)
 
     print(f"\n{'─'*72}")
-    print("Note: speedup > 1x means template is faster than example; latency speedup uses median latency.")
+    print("Note: speedup > 1x means template is faster than example; overall latency uses median latency, stage timings use direct latency ratios.")
 
     # Output-match check
     if has_both:
@@ -2746,6 +3235,9 @@ def benchmark_model_sweep(
         path = os.path.join(save_dir, "sweep_results.csv")
         fields = ["label", "gen_len", "mean", "median", "std", "min", "max",
                   "tok_per_sec", "ms_per_tok", "peak_mem_mb", "n_generated",
+                  *_MODEL_INPUT_META_KEYS,
+                  "audio_encoder_ms", "projector_ms", "encode_total_ms", "prefill_ms",
+                  "decode_step_ms", "decode_total_ms", "stage_sum_ms",
                   "wer", "cer", "latency_speedup_template_vs_example",
                   "hypothesis", "reference"]
         with open(path, "w", newline="", encoding="utf-8") as f:
@@ -2810,6 +3302,378 @@ def benchmark_model_sweep(
                     fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
                     print(f"  Plot saved: {path}")
 
+            fig, axes = plt.subplots(1, len(labels_present), figsize=(6 * len(labels_present), 4), squeeze=False)
+            for ax, lbl in zip(axes[0], labels_present):
+                xs = [e["gen_len"] for e in all_results[lbl]]
+                ax.plot(xs, [e["encode_total_ms"] for e in all_results[lbl]], marker="o",
+                        label="encode_total", color="steelblue")
+                ax.plot(xs, [e["prefill_ms"] for e in all_results[lbl]], marker="o",
+                        label="prefill", color="darkorange")
+                ax.plot(xs, [e["decode_total_ms"] for e in all_results[lbl]], marker="o",
+                        label="decode_total", color="darkgreen")
+                ax.plot(xs, [e["mean"] for e in all_results[lbl]], marker="o",
+                        label="total latency", color="black", linestyle="--")
+                ax.set_xlabel("max_new_tokens (decoder context)")
+                ax.set_ylabel("Latency (ms)")
+                ax.set_title(f"Stage Breakdown - {lbl}")
+                ax.grid(True)
+                ax.legend()
+            fig.tight_layout()
+            path = os.path.join(out_dir, "sweep_stage_breakdown.png")
+            fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
+            print(f"  Plot saved: {path}")
+
+
+def benchmark_model_input_sweep(
+    data_dir: str = None,
+    target_input_seconds: List[float] = None,
+    warmup: int = 2,
+    runs: int = 5,
+    max_new_tokens: int = 200,
+    save_dir: str = None,
+    do_plot: bool = False,
+):
+    """Input-length scaling benchmark using concatenated LibriSpeech prefixes."""
+    if target_input_seconds is None:
+        target_input_seconds = [1, 2, 4, 6, 8, 10, 12, 16, 20]
+    if data_dir is None:
+        data_dir = _LIBRISPEECH_DATA_DIR
+
+    target_input_seconds = [float(x) for x in target_input_seconds]
+    if not target_input_seconds:
+        print("  No input durations requested – aborting.")
+        return
+
+    print("\n" + "=" * 72)
+    print("INPUT-LENGTH SWEEP: template vs example  (audio context scaling)")
+    print(f"  input_seconds = {target_input_seconds}")
+    print(f"  max_new_tokens = {max_new_tokens}")
+    print(f"  warmup/runs    = {warmup}/{runs}")
+    print("=" * 72)
+
+    device = _device()
+    max_samples_needed = max(1, int(math.ceil(max(target_input_seconds) * 16000)))
+    audio_full, segments = _load_librispeech_samples(data_dir, max_samples_needed)
+    all_results: Dict[str, List[dict]] = {}
+
+    for folder, label in [(_TEMPLATE_DIR, "template"), (_EXAMPLE_DIR, "example")]:
+        print(f"\n[{label}] Loading model from {os.path.basename(folder)}...")
+        _model_load(folder)
+
+        try:
+            from weight_loader import load_model_from_hf
+            model, processor = load_model_from_hf("zai-org/GLM-ASR-Nano-2512")
+            generate_fn = _select_generate_fn(model)
+            label_results: List[dict] = []
+
+            for seconds in target_input_seconds:
+                n_samp = min(max(1, int(math.ceil(seconds * 16000))), len(audio_full))
+                audio_clip = audio_full[:n_samp]
+                audio_seconds = n_samp / 16000.0
+                reference_text = _get_reference(segments, n_samp)
+                input_features, input_ids, mask, input_meta = _prepare_model_benchmark_inputs(
+                    processor,
+                    audio_clip,
+                    device,
+                    pad_to_max_length=False,
+                )
+                encoder_ctx_tokens = input_meta["encoder_ctx_tokens"]
+
+                def _call():
+                    return _call_generate(
+                        generate_fn,
+                        input_features,
+                        input_ids,
+                        mask,
+                        max_new_tokens=max_new_tokens,
+                        temperature=1.0,
+                        top_k=1,
+                    )
+
+                print(
+                    f"  audio={audio_seconds:5.1f}s  ctx={encoder_ctx_tokens:4d} toks  warming up...",
+                    end="",
+                    flush=True,
+                )
+                for _ in range(warmup):
+                    output = _call()
+
+                if torch.cuda.is_available():
+                    torch.cuda.reset_peak_memory_stats()
+                times, outputs = timed_run_collect_outputs(_call, warmup=0, runs=runs)
+                peak_mem = (torch.cuda.max_memory_allocated() / 1024**2
+                            if torch.cuda.is_available() else float("nan"))
+
+                output = outputs[-1] if outputs else output
+                hypothesis_text = _decode_output(output, input_ids.shape[-1], processor) \
+                    if hasattr(output, "shape") else ""
+                wer, cer = _wer_cer(hypothesis_text, reference_text)
+
+                stats = _summarize_times(times)
+                generated_counts = [
+                    _generated_token_count(out, input_ids.shape[-1], max_new_tokens)
+                    for out in outputs
+                ]
+                total_generated = float(np.sum(generated_counts))
+                total_time_s = float(np.sum(times)) / 1000.0
+                avg_generated = float(np.mean(generated_counts)) if generated_counts else float(max_new_tokens)
+                mean_ms = stats["mean"]
+                tok_per_sec = total_generated / total_time_s if total_time_s > 0 else float("nan")
+                ms_per_tok = mean_ms / avg_generated if avg_generated > 0 else float("nan")
+
+                stage_timings = _measure_model_stage_timings(
+                    model,
+                    input_features,
+                    input_ids,
+                    mask,
+                    max_new_tokens=max_new_tokens,
+                    generation_mode=label,
+                    warmup=warmup,
+                    runs=runs,
+                )
+
+                print(f"  {mean_ms:.1f}ms  {tok_per_sec:.1f}tok/s  {ms_per_tok:.2f}ms/tok  {peak_mem:.0f}MB")
+                print(
+                    "    input: "
+                    f"raw_frames={input_meta['raw_input_frames']}  "
+                    f"used_frames={input_meta['used_input_frames']}  "
+                    f"valid_frames={input_meta['valid_input_frames']}  "
+                    f"trimmed={input_meta['input_trimmed']}"
+                )
+                print(
+                    "    stages: "
+                    f"audio_encoder={stage_timings['audio_encoder_ms']:.2f}ms  "
+                    f"projector={stage_timings['projector_ms']:.2f}ms  "
+                    f"encode={stage_timings['encode_total_ms']:.2f}ms  "
+                    f"prefill={stage_timings['prefill_ms']:.2f}ms  "
+                    f"decode_total={stage_timings['decode_total_ms']:.2f}ms"
+                )
+                _show = lambda s, n=200: s[:n] + "..." if len(s) > n else s
+                print(f"    hyp ({len(hypothesis_text.split()):3d} words): {_show(hypothesis_text)}")
+                print(f"    WER={wer:.3f}  CER={cer:.3f}")
+
+                label_results.append({
+                    "audio_seconds": audio_seconds,
+                    "n_audio_samples": n_samp,
+                    "mean": mean_ms,
+                    "median": stats["median"],
+                    "std": stats["std"],
+                    "min": stats["min"],
+                    "max": stats["max"],
+                    "tok_per_sec": tok_per_sec,
+                    "ms_per_tok": ms_per_tok,
+                    "peak_mem_mb": peak_mem,
+                    "n_generated": avg_generated,
+                    **input_meta,
+                    "wer": wer,
+                    "cer": cer,
+                    "hypothesis": hypothesis_text,
+                    "reference": reference_text,
+                    **stage_timings,
+                })
+
+            all_results[label] = label_results
+
+        except Exception as e:
+            print(f"  ERROR in {label}: {e}")
+            import traceback; traceback.print_exc()
+        finally:
+            try:
+                del model
+                del processor
+            except Exception:
+                pass
+            _model_unload(folder)
+
+    labels_present = [l for l in ["template", "example"] if l in all_results]
+    if not labels_present:
+        return
+
+    col_w = 13
+
+    def _hdr(name): return f"{name:>{col_w}s}"
+    def _val(v, fmt=".1f"): return f"{v:{col_w}{fmt}}" if not math.isnan(v) else f"{'N/A':>{col_w}s}"
+
+    has_both = len(labels_present) == 2
+    latency_speedup_by_n_samp: Dict[int, float] = {}
+    if has_both:
+        template_by_n = {e["n_audio_samples"]: e for e in all_results["template"]}
+        example_by_n = {e["n_audio_samples"]: e for e in all_results["example"]}
+        for n_samp in sorted(set(template_by_n) & set(example_by_n)):
+            template_median = template_by_n[n_samp].get("median", template_by_n[n_samp].get("mean", float("nan")))
+            example_median = example_by_n[n_samp].get("median", example_by_n[n_samp].get("mean", float("nan")))
+            if not math.isnan(template_median) and not math.isnan(example_median) and template_median > 0:
+                latency_speedup_by_n_samp[n_samp] = example_median / template_median
+            else:
+                latency_speedup_by_n_samp[n_samp] = float("nan")
+
+    print("\n" + "=" * 72)
+    print("INPUT SWEEP SUMMARY  (template vs example)")
+    print("=" * 72)
+
+    for metric_key, metric_label, fmt in [
+        ("mean", "Mean latency (ms)", ".1f"),
+        ("median", "Median latency (ms)", ".1f"),
+        ("tok_per_sec", "Throughput (tok/s)", ".1f"),
+        ("ms_per_tok", "Latency/token (ms/tok)", ".2f"),
+        ("peak_mem_mb", "Peak GPU mem (MB)", ".0f"),
+        ("encoder_ctx_tokens", "Encoder ctx (tokens)", ".0f"),
+        ("audio_encoder_ms", "Audio encoder (ms)", ".2f"),
+        ("projector_ms", "Projector (ms)", ".2f"),
+        ("encode_total_ms", "Encode total (ms)", ".2f"),
+        ("prefill_ms", "Prefill (ms)", ".2f"),
+        ("decode_step_ms", "Decode step (ms)", ".2f"),
+        ("decode_total_ms", "Decode total (ms)", ".2f"),
+        ("stage_sum_ms", "Stage sum (ms)", ".2f"),
+        ("wer", "WER", ".3f"),
+        ("cer", "CER", ".3f"),
+    ]:
+        print(f"\n{metric_label}")
+        hdr = f"{'audio_s':>10s}" + "".join(_hdr(l) for l in labels_present)
+        if has_both:
+            hdr += _hdr("speedup")
+        print(hdr); print("-" * len(hdr))
+
+        rows_by_n_samp: Dict[int, Dict[str, float]] = {}
+        audio_seconds_by_n_samp: Dict[int, float] = {}
+        for lbl in labels_present:
+            for entry in all_results[lbl]:
+                n_samp = entry["n_audio_samples"]
+                rows_by_n_samp.setdefault(n_samp, {})[lbl] = entry.get(metric_key, float("nan"))
+                audio_seconds_by_n_samp.setdefault(n_samp, entry["audio_seconds"])
+
+        for n_samp in sorted(rows_by_n_samp):
+            row = f"{audio_seconds_by_n_samp[n_samp]:>10.1f}"
+            vals = [rows_by_n_samp[n_samp].get(l, float("nan")) for l in labels_present]
+            row += "".join(_val(v, fmt) for v in vals)
+            if has_both and not any(math.isnan(v) for v in vals):
+                if metric_key in (
+                    "mean", "median", "audio_encoder_ms", "projector_ms",
+                    "encode_total_ms", "prefill_ms", "decode_step_ms",
+                    "decode_total_ms", "stage_sum_ms",
+                ):
+                    spd = latency_speedup_by_n_samp.get(n_samp, float("nan"))
+                    if metric_key not in ("mean", "median") and vals[0] > 0:
+                        spd = vals[1] / vals[0]
+                elif metric_key in ("ms_per_tok",):
+                    spd = vals[1] / vals[0] if vals[0] > 0 else float("nan")
+                elif metric_key in ("tok_per_sec",):
+                    spd = vals[0] / vals[1] if vals[1] > 0 else float("nan")
+                else:
+                    spd = float("nan")
+                if not math.isnan(spd):
+                    row += f"{spd:{col_w}.2f}x"
+            print(row)
+
+    print(f"\n{'─'*72}")
+    print("Note: speedup > 1x means template is faster than example; overall latency uses median latency, stage timings use direct latency ratios.")
+
+    if has_both:
+        print("\nOutput match check (template vs example):")
+        t_map = {e["n_audio_samples"]: e.get("hypothesis", "") for e in all_results["template"]}
+        e_map = {e["n_audio_samples"]: e.get("hypothesis", "") for e in all_results["example"]}
+        for n_samp in sorted(t_map):
+            match = "MATCH" if t_map[n_samp].strip() == e_map.get(n_samp, "").strip() else "DIFFER"
+            seconds = n_samp / 16000.0
+            print(f"  audio={seconds:5.1f}s: {match}")
+            if match == "DIFFER":
+                print(f"    template: {t_map[n_samp][:100]}")
+                print(f"    example : {e_map.get(n_samp, '')[:100]}")
+
+    if save_dir:
+        import csv
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.join(save_dir, "input_sweep_results.csv")
+        fields = [
+            "label",
+            "audio_seconds",
+            "n_audio_samples",
+            "mean",
+            "median",
+            "std",
+            "min",
+            "max",
+            "tok_per_sec",
+            "ms_per_tok",
+            "peak_mem_mb",
+            "n_generated",
+            *_MODEL_INPUT_META_KEYS,
+            "audio_encoder_ms",
+            "projector_ms",
+            "encode_total_ms",
+            "prefill_ms",
+            "decode_step_ms",
+            "decode_total_ms",
+            "stage_sum_ms",
+            "wer",
+            "cer",
+            "latency_speedup_template_vs_example",
+            "hypothesis",
+            "reference",
+        ]
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+            w.writeheader()
+            for lbl in labels_present:
+                for entry in all_results[lbl]:
+                    w.writerow({
+                        "label": lbl,
+                        **entry,
+                        "latency_speedup_template_vs_example": latency_speedup_by_n_samp.get(
+                            entry["n_audio_samples"], float("nan")
+                        ),
+                    })
+        print(f"\n  Saved: {path}")
+
+    if do_plot:
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            print("  [plot] matplotlib not available – skipping plots.")
+        else:
+            out_dir = save_dir or "results_input_sweep"
+            os.makedirs(out_dir, exist_ok=True)
+
+            fig, axes = plt.subplots(1, len(labels_present), figsize=(6 * len(labels_present), 4), squeeze=False)
+            for ax, lbl in zip(axes[0], labels_present):
+                xs = [e["audio_seconds"] for e in all_results[lbl]]
+                ax.plot(xs, [e["mean"] for e in all_results[lbl]], marker="o",
+                        label="total latency", color="black")
+                ax.set_xlabel("audio seconds")
+                ax.set_ylabel("Latency (ms)")
+                ax.set_title(f"Input Sweep Latency - {lbl}")
+                ax.grid(True)
+                ax.legend()
+            fig.tight_layout()
+            path = os.path.join(out_dir, "input_sweep_latency.png")
+            fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
+            print(f"  Plot saved: {path}")
+
+            fig, axes = plt.subplots(1, len(labels_present), figsize=(6 * len(labels_present), 4), squeeze=False)
+            for ax, lbl in zip(axes[0], labels_present):
+                xs = [e["audio_seconds"] for e in all_results[lbl]]
+                ax.plot(xs, [e["audio_encoder_ms"] for e in all_results[lbl]], marker="o",
+                        label="audio_encoder", color="steelblue")
+                ax.plot(xs, [e["projector_ms"] for e in all_results[lbl]], marker="o",
+                        label="projector", color="mediumpurple")
+                ax.plot(xs, [e["encode_total_ms"] for e in all_results[lbl]], marker="o",
+                        label="encode_total", color="dodgerblue")
+                ax.plot(xs, [e["prefill_ms"] for e in all_results[lbl]], marker="o",
+                        label="prefill", color="darkorange")
+                ax.plot(xs, [e["decode_total_ms"] for e in all_results[lbl]], marker="o",
+                        label="decode_total", color="darkgreen")
+                ax.plot(xs, [e["mean"] for e in all_results[lbl]], marker="o",
+                        label="total latency", color="black", linestyle="--")
+                ax.set_xlabel("audio seconds")
+                ax.set_ylabel("Latency (ms)")
+                ax.set_title(f"Input Sweep Stage Breakdown - {lbl}")
+                ax.grid(True)
+                ax.legend()
+            fig.tight_layout()
+            path = os.path.join(out_dir, "input_sweep_stage_breakdown.png")
+            fig.savefig(path, dpi=150, bbox_inches="tight"); plt.close(fig)
+            print(f"  Plot saved: {path}")
+
 
 # ---------------------------------------------------------------------------
 # Registry and main
@@ -2840,17 +3704,19 @@ def main():
         description="GLM-ASR Triton Kernel Benchmark: template vs example vs PyTorch"
     )
     parser.add_argument("--kernel", type=str, default="attention",
-        help="Kernel(s) to benchmark: comma-separated, 'all', or 'model'")
+        help="Kernel(s) to benchmark: comma-separated, 'all', 'model', 'model_sweep', 'model_input_sweep', or 'model_correctness'")
     parser.add_argument("--audio", type=str, default=None,
         help="Path to audio file (WAV or MP3) for --kernel model")
     parser.add_argument("--seq-lens", type=str, default=None,
-        help="Comma-separated sequence lengths (default per kernel)")
+        help="Comma-separated sequence lengths (default per kernel; for model_sweep these are decoder generation lengths)")
+    parser.add_argument("--input-seconds", type=str, default=None,
+        help="Comma-separated audio durations in seconds for --kernel model_input_sweep")
     parser.add_argument("--block-sizes", type=str, default=None,
         help="Comma-separated block/tile sizes (default per kernel)")
     parser.add_argument("--runs", type=int, default=20,
-        help="Number of timed iterations (default: 20; model default: 5)")
+        help="Number of timed iterations (default: 20 for kernels; model modes default to 5 when omitted)")
     parser.add_argument("--warmup", type=int, default=5,
-        help="Number of warmup iterations (default: 5)")
+        help="Number of warmup iterations (default: 5 for kernels; model modes default to 2 when omitted)")
     parser.add_argument("--max-new-tokens", type=int, default=50,
         help="Max new tokens for model benchmark")
     parser.add_argument("--save", type=str, default=None,
@@ -2877,6 +3743,8 @@ def main():
         print(f"GPU:    {torch.cuda.get_device_name(0)}")
 
     data_dir = args.data_dir if args.data_dir else os.path.join(_SCRIPT_DIR, "data")
+    runs_provided = "--runs" in sys.argv
+    warmup_provided = "--warmup" in sys.argv
 
     # -- Correctness E2E (WER/CER on real utterances) --
     if args.kernel.strip() == "model_correctness":
@@ -2892,14 +3760,32 @@ def main():
 
     # -- Performance E2E sweep (decoder context scaling) --
     if args.kernel.strip() == "model_sweep":
-        runs = args.runs if args.runs != 20 else 5
-        gen_lens = ([int(x) for x in args.seq_lens.split(",")]
+        runs = args.runs if runs_provided else 5
+        warmup = args.warmup if warmup_provided else 2
+        gen_lens = ([int(x.strip()) for x in args.seq_lens.split(",")]
                     if args.seq_lens else None)
         benchmark_model_sweep(
             data_dir=data_dir,
             target_gen_lens=gen_lens,
-            warmup=args.warmup,
+            warmup=warmup,
             runs=runs,
+            save_dir=args.save,
+            do_plot=args.plot,
+        )
+        return
+
+    # -- Input-length E2E sweep (audio context scaling) --
+    if args.kernel.strip() == "model_input_sweep":
+        runs = args.runs if runs_provided else 5
+        warmup = args.warmup if warmup_provided else 2
+        input_seconds = ([float(x.strip()) for x in args.input_seconds.split(",")]
+                         if args.input_seconds else None)
+        benchmark_model_input_sweep(
+            data_dir=data_dir,
+            target_input_seconds=input_seconds,
+            warmup=warmup,
+            runs=runs,
+            max_new_tokens=args.max_new_tokens,
             save_dir=args.save,
             do_plot=args.plot,
         )
@@ -2907,9 +3793,10 @@ def main():
 
     # -- Model benchmark --
     if "model" in args.kernel:
-        runs = args.runs if args.runs != 20 else 5
-        benchmark_model(args.audio, warmup=args.warmup, runs=runs,
-                        max_new_tokens=args.max_new_tokens)
+        runs = args.runs if runs_provided else 5
+        warmup = args.warmup if warmup_provided else 2
+        benchmark_model(args.audio, warmup=warmup, runs=runs,
+                        max_new_tokens=args.max_new_tokens, save_dir=args.save)
         return
 
     # -- Kernel microbenchmarks --
