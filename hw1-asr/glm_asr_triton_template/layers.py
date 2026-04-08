@@ -249,6 +249,123 @@ def linear_kernel_tf32(
     
     tl.store(c_ptr + c_offsets, accumulator, mask=c_mask)
 
+# @triton.autotune(
+#     configs=[
+#         triton.Config({'BLOCK_M': 16, 'BLOCK_N': 32, 'BLOCK_K': 32}, num_warps=2),
+#         triton.Config({'BLOCK_M': 16, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4),
+#         triton.Config({'BLOCK_M': 16, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4),
+#         triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4),
+#         triton.Config({'BLOCK_M': 32, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=4),
+#         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 32}, num_warps=4),
+#         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 64}, num_warps=8),
+#     ],
+#     key=['M', 'N', 'K'],
+# )
+@triton.jit
+def linear_kernel_tf16(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    M,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """
+    TF16-style matmul: output = A @ B.
+    A: (M, K), B: (K, N), C: (M, N)
+
+    *** TODO: Implement this kernel ***
+
+    Grid: (M // BLOCK_M, N // BLOCK_N)
+    """
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, K, BLOCK_K):
+        a = tl.load(
+            a_ptr + offs_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak,
+            mask=(offs_m[:, None] < M) & (k + offs_k[None, :] < K),
+            other=0.0,
+        ).to(tl.float32) 
+        b = tl.load(
+            b_ptr + (k + offs_k[:, None]) * stride_bk + offs_n[None, :] * stride_bn,
+            mask=(k + offs_k[:, None] < K) & (offs_n[None, :] < N),
+            other=0.0,
+        ).to(tl.float32) 
+        acc += tl.dot(a, b)
+
+    tl.store(
+        c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+        acc,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
+
+@triton.jit
+def linear_kernel_int8(
+    a_ptr,      # (M, K) float32 input
+    b_ptr,      # (K, N) int8 weights
+    scale_ptr,  # (N,) float32 per-channel scales
+    c_ptr,      # (M, N) float32 output
+    M, N, K,
+    stride_am, stride_ak,
+    stride_bk, stride_bn,
+    stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k in range(0, K, BLOCK_K):
+        a = tl.load(
+            a_ptr + offs_m[:, None] * stride_am + (k + offs_k[None, :]) * stride_ak,
+            mask=(offs_m[:, None] < M) & (k + offs_k[None, :] < K),
+            other=0.0,
+        ).to(tl.float32)
+
+        b = tl.load(
+            b_ptr + (k + offs_k[:, None]) * stride_bk + offs_n[None, :] * stride_bn,
+            mask=(k + offs_k[:, None] < K) & (offs_n[None, :] < N),
+            other=0,
+        ).to(tl.float32)  # int8 -> float32 on chip
+
+        acc += tl.dot(a, b)
+
+    # load per-channel scales and dequantize
+    scale = tl.load(
+        scale_ptr + offs_n,
+        mask=offs_n < N,
+        other=1.0,
+    )
+    acc = acc * scale[None, :]  # (BLOCK_M, BLOCK_N) * (BLOCK_N,)
+
+    tl.store(
+        c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+        acc,
+        mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+    )
 
 @triton.jit
 def linear_gelu_kernel(
@@ -733,7 +850,7 @@ class Linear:
     TILE_K = 32
     GROUP_SIZE = 8
 
-    BACKEND = "torch"
+    BACKEND = "triton_int8"
 
     def __init__(self, in_features: int, out_features: int, bias: bool = True):
         self.in_features = in_features
@@ -747,6 +864,10 @@ class Linear:
         self._K_padded = None
         self._N_padded = None
 
+        self._weight_int8 = None
+        self._weight_scale = None
+        self._int8_output_buffer = None
+
     def _ensure_weight_prepared(self):
         """Cache transposed and padded weight for Triton kernel."""
         if self._weight_t_padded is None:
@@ -755,7 +876,7 @@ class Linear:
             self._K_padded = pad_to_multiple(K, self.TILE_K)
             self._N_padded = pad_to_multiple(N, self.TILE_N)
 
-            weight_t = self.weight.t().contiguous()
+            weight_t = self.weight.t().contiguous().to(torch.float32)
             if self._K_padded > K or self._N_padded > N:
                 weight_pad = torch.zeros(
                     (self._K_padded, self._N_padded),
@@ -767,11 +888,39 @@ class Linear:
             else:
                 self._weight_t_padded = weight_t
 
+    def _ensure_weight_prepared_int8(self):
+        if self._weight_int8 is None:
+            K = self.in_features
+            N = self.out_features
+            K_padded = pad_to_multiple(K, self.TILE_K)
+            N_padded = pad_to_multiple(N, self.TILE_N)
+
+            w = self.weight.float()  # (N, K)
+            scale = w.abs().max(dim=1, keepdim=True).values / 127.0  # (N, 1)
+            scale = scale.clamp(min=1e-8)
+            w_int8 = w.div(scale).round().clamp(-127, 127).to(torch.int8)
+            w_int8_t = w_int8.t().contiguous()  # (K, N)
+
+            if K_padded > K or N_padded > N:
+                w_padded = torch.zeros(
+                    (K_padded, N_padded),
+                    dtype=torch.int8,
+                    device=w_int8_t.device,
+                )
+                w_padded[:K, :N] = w_int8_t
+                self._weight_int8 = w_padded
+            else:
+                self._weight_int8 = w_int8_t
+
+            self._weight_scale = scale.squeeze(1).float().contiguous()  # (N,)
+
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         if Linear.BACKEND in ("torch", "cublas"):
             return self._forward_torch(x)
         if Linear.BACKEND == "triton":
             return self._forward_triton(x)
+        if Linear.BACKEND == "triton_int8":
+            return self._forward_int8(x)
         M = int(np.prod(x.shape[:-1]))
         if M >= self.TILE_M and x.is_cuda:
             return self._forward_triton(x)
@@ -849,6 +998,67 @@ class Linear:
             BLOCK_N=self.TILE_N,
             BLOCK_K=self.TILE_K,
             GROUP_SIZE=self.GROUP_SIZE,
+        )
+
+        output = output[:M, :N]
+
+        if self.has_bias and self.bias_param is not None:
+            if self.bias_param.device != x.device:
+                self.bias_param = self.bias_param.to(x.device)
+            output = output + self.bias_param
+
+        return output.reshape(*batch_dims, self.out_features)
+    
+    def _forward_int8(self, x: torch.Tensor) -> torch.Tensor:
+        """INT8 weight quantization Triton backend."""
+        original_shape = x.shape
+        batch_dims = original_shape[:-1]
+
+        M = int(np.prod(batch_dims))
+        K = self.in_features
+        N = self.out_features
+
+        x_2d = x.reshape(M, K).to(torch.float32).contiguous()
+
+        self._ensure_weight_prepared()
+        self._ensure_weight_prepared_int8()
+
+        # Then move everything to GPU once
+        if self._weight_int8.device != x.device:
+            self._weight_int8 = self._weight_int8.to(x.device)
+            self._weight_scale = self._weight_scale.to(x.device)
+            self.weight = self.weight.to(x.device)
+
+        tile_m = 16 if M <= 16 else 64
+
+        M_padded = pad_to_multiple(M, tile_m)
+        K_padded = pad_to_multiple(K, self.TILE_K)
+        N_padded = pad_to_multiple(N, self.TILE_N)
+
+        if M_padded > M or K_padded > K:
+            x_padded = torch.zeros((M_padded, K_padded), dtype=torch.float32, device=x.device)
+            x_padded[:M, :K] = x_2d
+        else:
+            x_padded = x_2d
+        
+        output = torch.zeros((M_padded, N_padded), dtype=torch.float32, device=x.device)
+
+        grid = (
+            triton.cdiv(M_padded, tile_m),
+            triton.cdiv(N_padded, self.TILE_N),
+        )
+        linear_kernel_int8[grid](
+            x_padded,
+            self._weight_int8,
+            self._weight_scale,
+            output,
+            M_padded, N_padded, K_padded,
+            x_padded.stride(0), x_padded.stride(1),
+            self._weight_int8.stride(0), self._weight_int8.stride(1),
+            output.stride(0), output.stride(1),
+            BLOCK_M=tile_m,
+            BLOCK_N=self.TILE_N,
+            BLOCK_K=self.TILE_K,
         )
 
         output = output[:M, :N]
@@ -1218,3 +1428,4 @@ if __name__ == "__main__":
     print(f"Input: {x.shape} -> Output: {y.shape}")
 
     print("\nAll Triton layers working!")
+
